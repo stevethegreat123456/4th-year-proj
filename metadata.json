@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Deriv HF Bot even odd",
+  "description": "High-frequency trading bot for Deriv synthetic indices.",
+  "requestFramePermissions": [
+    "screen-wake-lock"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
