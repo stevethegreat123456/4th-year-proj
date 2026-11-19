@@ -11,7 +11,7 @@ import {
 
 export type { DerivAccount };
 
-export type StrategyType = 'DIGIT_OVER' | 'EVEN_ODD';
+export type StrategyType = 'DIGIT_OVER' | 'EVEN_ODD' | 'DCIRCLES_EVEN_ODD';
 export type EvenOddMode = 'reversal' | 'follow';
 
 export interface MarketData {
@@ -23,6 +23,9 @@ export interface MarketData {
   evenStreak: number;
   oddStreak: number;
   streakHistory: number[];
+  dCirclesTickCount?: number;
+  dCirclesMostDigits?: number[];
+  dCirclesLeastDigits?: number[];
 }
 
 export interface Trade {
@@ -120,6 +123,8 @@ interface AppState {
   setSelectedMarkets: (symbols: string[]) => void;
   toggleSubscribedMarket: (symbol: string) => void;
   setSubscribedMarkets: (symbols: string[]) => void;
+  dCirclesSymbol: string;
+  setDCirclesSymbol: (symbol: string) => void;
   auth: AuthState;
   setAuth: (auth: Partial<AuthState>) => void;
   switchAccount: (account: DerivAccount) => void;
@@ -362,7 +367,13 @@ export const useStore = create<AppState>()((set) => ({
       const normalizedStrategy: StrategyType =
         (newSettings.strategy as string) === 'RISE_FALL'
           ? 'EVEN_ODD'
-          : (newSettings.strategy || state.settings.strategy || 'DIGIT_OVER');
+          : newSettings.strategy === 'DCIRCLES_EVEN_ODD'
+            ? 'DCIRCLES_EVEN_ODD'
+            : newSettings.strategy === 'EVEN_ODD'
+              ? 'EVEN_ODD'
+              : newSettings.strategy === 'DIGIT_OVER'
+                ? 'DIGIT_OVER'
+                : (state.settings.strategy || 'DIGIT_OVER');
       const normalizedSelectedMarkets = Array.isArray(newSettings.selectedMarkets)
         ? newSettings.selectedMarkets
         : legacyPayload.selectedMarket &&
@@ -478,6 +489,20 @@ export const useStore = create<AppState>()((set) => ({
         window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: updated }));
       }
       return { settings: updated, markets: updatedMarkets };
+    }),
+  dCirclesSymbol: (() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('deriv_dcircles_symbol');
+      if (saved && ALL_MARKET_SYMBOLS.includes(saved as any)) return saved;
+    }
+    return 'R_100';
+  })(),
+  setDCirclesSymbol: (symbol) =>
+    set(() => {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('deriv_dcircles_symbol', symbol);
+      }
+      return { dCirclesSymbol: symbol };
     }),
   isRunning: false,
   setIsRunning: (run) => set({ isRunning: run }),

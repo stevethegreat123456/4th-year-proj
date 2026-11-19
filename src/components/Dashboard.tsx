@@ -6,9 +6,10 @@ import { MarketGrid } from './MarketGrid';
 import { TradeLog } from './TradeLog';
 import { StatsPanel } from './StatsPanel';
 import { BacktestLab } from './BacktestLab';
+import { DigitCircles } from './DigitCircles';
 import { useWakeLock } from '../hooks/useWakeLock';
 import { io, Socket } from 'socket.io-client';
-import { Activity, AlertTriangle, FlaskConical, X } from 'lucide-react';
+import { Activity, AlertTriangle, CircleDot, FlaskConical, X } from 'lucide-react';
 
 import { DerivAuth } from './DerivAuth';
 import { getAuthInfo, getStoredOAuthClientId, refreshAccessToken, DEFAULT_APP_ID } from '../utils/derivAuth';
@@ -27,7 +28,7 @@ export function Dashboard() {
   const workerRef = useRef<Worker | null>(null);
 
   const [isPending, setIsPending] = React.useState(false);
-  const [activeView, setActiveView] = React.useState<'live' | 'backtest'>('live');
+  const [activeView, setActiveView] = React.useState<'live' | 'dcircles' | 'backtest'>('live');
   const [alertBanner, setAlertBanner] = React.useState<{
     type: 'error' | 'warning' | 'info';
     message: string;
@@ -324,6 +325,18 @@ export function Dashboard() {
             </button>
             <button
               type="button"
+              onClick={() => setActiveView('dcircles')}
+              className={`px-2.5 py-1 rounded flex items-center gap-1.5 font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                activeView === 'dcircles'
+                  ? 'bg-[#27272a] text-[#00ff9c]'
+                  : 'text-[#a1a1aa] hover:text-[#e4e4e7]'
+              }`}
+            >
+              <CircleDot size={12} />
+              <span>D-Circles</span>
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveView('backtest')}
               className={`px-2.5 py-1 rounded flex items-center gap-1.5 font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                 activeView === 'backtest'
@@ -408,7 +421,7 @@ export function Dashboard() {
           <>
             <div className="flex-1 flex flex-col overflow-hidden">
               <div className="flex-1 overflow-y-auto p-3 sm:p-5">
-                <MarketGrid />
+                {activeView === 'dcircles' ? <DigitCircles /> : <MarketGrid />}
               </div>
               <div className="shrink-0 h-[120px] sm:h-[140px]">
                 <TradeLog />

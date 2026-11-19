@@ -133,7 +133,10 @@ export function BacktestLab() {
   const setSelectedMarkets = useStore((state) => state.setSelectedMarkets);
 
   const [config, setConfig] = useState<BacktestConfig>({
-    strategy: settings.strategy === 'EVEN_ODD' ? 'EVEN_ODD' : 'DIGIT_OVER',
+    strategy:
+      settings.strategy === 'EVEN_ODD' || settings.strategy === 'DCIRCLES_EVEN_ODD'
+        ? settings.strategy
+        : 'DIGIT_OVER',
     evenOddMode: settings.evenOddMode || 'reversal',
     targetStreak: settings.targetStreak || 3,
     baseStake: settings.globalStake || 1,
@@ -224,7 +227,11 @@ export function BacktestLab() {
     }
   };
 
-  const handleRunBacktest = async () => {
+  const handleRunBacktest = async (overrideStrategy?: StrategyType) => {
+    const activeStrategy = overrideStrategy || config.strategy;
+    const activeConfig: BacktestConfig = { ...config, strategy: activeStrategy };
+    const fetchCount = activeStrategy === 'DCIRCLES_EVEN_ODD' ? 10000 : 5000;
+
     setIsFetching(true);
     setFetchErrorBanner(null);
     setAiError(null);
@@ -235,7 +242,7 @@ export function BacktestLab() {
     try {
       const { series } = await fetchMarketsTickHistory(
         [...ALL_MARKET_SYMBOLS],
-        5000,
+        fetchCount,
         (prog) => setFetchProgress(prog)
       );
 
@@ -244,9 +251,9 @@ export function BacktestLab() {
       }
 
       setTickCache(series);
-      const computed = runBacktestSuite(series, config);
+      const computed = runBacktestSuite(series, activeConfig);
       if (computed.length > 0) {
-        void triggerAIAnalysis(computed, config);
+        void triggerAIAnalysis(computed, activeConfig);
       }
     } catch (err: any) {
       setFetchErrorBanner(err?.message || 'Backtest fetch failed');
@@ -310,7 +317,7 @@ export function BacktestLab() {
 
             <button
               type="button"
-              onClick={handleRunBacktest}
+              onClick={() => handleRunBacktest()}
               disabled={isFetching}
               className="px-4 py-2 rounded bg-[#00ff9c] text-[#09090b] hover:opacity-90 disabled:opacity-50 font-mono text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
@@ -324,14 +331,20 @@ export function BacktestLab() {
               ) : (
                 <>
                   <Play size={13} fill="currentColor" />
-                  <span>{tickCache.length > 0 ? 'Re-scan 5K Ticks' : 'Find Best Markets'}</span>
+                  <span>
+                    {tickCache.length > 0
+                      ? config.strategy === 'DCIRCLES_EVEN_ODD'
+                        ? 'Re-scan 10K (5K+5K)'
+                        : 'Re-scan 5K Ticks'
+                      : 'Find Best Markets'}
+                  </span>
                 </>
               )}
             </button>
           </div>
 
           <div className="flex flex-wrap items-end gap-3 pt-3 border-t border-[#27272a] font-mono text-xs">
-            <div className="flex flex-col gap-1 min-w-[130px]">
+            <div className="flex flex-col gap-1 min-w-[175px]">
               <label className="text-[10px] text-[#a1a1aa] uppercase">Strategy</label>
               <select
                 value={config.strategy}
@@ -340,7 +353,8 @@ export function BacktestLab() {
                 }
                 className="bg-[#18181b] border border-[#27272a] rounded px-2.5 py-1.5 text-[#e4e4e7] outline-none focus:border-[#00ff9c]"
               >
-                <option value="EVEN_ODD">Even / Odd</option>
+                <option value="EVEN_ODD">Even / Odd (Streak)</option>
+                <option value="DCIRCLES_EVEN_ODD">D-Circles Even / Odd (5K)</option>
                 <option value="DIGIT_OVER">Digit Over 1</option>
               </select>
             </div>
@@ -361,22 +375,31 @@ export function BacktestLab() {
               </div>
             )}
 
-            <div className="flex flex-col gap-1 w-24">
-              <label className="text-[10px] text-[#a1a1aa] uppercase">Streak</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={config.targetStreak}
-                onChange={(e) =>
-                  setConfig((prev) => ({
-                    ...prev,
-                    targetStreak: Math.max(1, Math.min(10, Number(e.target.value) || 1)),
-                  }))
-                }
-                className="bg-[#18181b] border border-[#27272a] rounded px-2.5 py-1.5 text-[#00ff9c] text-right tabular-nums outline-none focus:border-[#00ff9c]"
-              />
-            </div>
+            {config.strategy !== 'DCIRCLES_EVEN_ODD' ? (
+              <div className="flex flex-col gap-1 w-24">
+                <label className="text-[10px] text-[#a1a1aa] uppercase">Streak</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={config.targetStreak}
+                  onChange={(e) =>
+                    setConfig((prev) => ({
+                      ...prev,
+                      targetStreak: Math.max(1, Math.min(10, Number(e.target.value) || 1)),
+                    }))
+                  }
+                  className="bg-[#18181b] border border-[#27272a] rounded px-2.5 py-1.5 text-[#00ff9c] text-right tabular-nums outline-none focus:border-[#00ff9c]"
+                />
+              </div>
+            ) : (
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-[#a1a1aa] uppercase">Entry Rule</span>
+                <span className="px-2.5 py-1.5 rounded bg-[#18181b] border border-[#27272a] text-[#00ff9c] text-[11px] whitespace-nowrap">
+                  5K Most &amp; Least Same Parity
+                </span>
+              </div>
+            )}
 
             <div className="flex flex-col gap-1 w-28">
               <label className="text-[10px] text-[#a1a1aa] uppercase">Stake ($)</label>
@@ -407,6 +430,24 @@ export function BacktestLab() {
               </button>
             )}
           </div>
+
+          {config.strategy === 'DCIRCLES_EVEN_ODD' &&
+            tickCache.length > 0 &&
+            tickCache[0].digits.length <= 5000 &&
+            !isFetching && (
+              <div className="flex flex-wrap items-center justify-between gap-2 bg-[#ffb000]/10 border border-[#ffb000]/30 text-[#ffb000] px-3 py-2 rounded text-xs font-mono">
+                <span>
+                  Cached data has 5,000 ticks (partial rolling warmup). Scan 10,000 ticks for full 5,000-tick lookback per trade.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleRunBacktest('DCIRCLES_EVEN_ODD')}
+                  className="px-2.5 py-1 rounded bg-[#ffb000]/20 hover:bg-[#ffb000]/30 font-bold cursor-pointer whitespace-nowrap"
+                >
+                  Load Full 10K Ticks
+                </button>
+              </div>
+            )}
 
           {isFetching && fetchProgress && (
             <div className="space-y-1 pt-1 font-mono text-[11px]">
@@ -456,7 +497,7 @@ export function BacktestLab() {
             </div>
             <button
               type="button"
-              onClick={handleRunBacktest}
+              onClick={() => handleRunBacktest()}
               className="px-5 py-2 rounded bg-[#00ff9c] text-[#09090b] font-mono text-xs font-bold flex items-center gap-2 hover:opacity-90 cursor-pointer"
             >
               <Play size={13} fill="currentColor" />

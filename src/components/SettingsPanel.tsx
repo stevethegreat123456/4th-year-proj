@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Settings as SettingsIcon, X, Hash, Binary } from 'lucide-react';
+import { Settings as SettingsIcon, X, Hash, Binary, CircleDot } from 'lucide-react';
 import { useStore, StrategyType, EvenOddMode } from '../store/useStore';
 
 export function SettingsPanel() {
@@ -8,7 +8,11 @@ export function SettingsPanel() {
   const setSettings = useStore(state => state.setSettings);
 
   const normalizeStrategy = (s?: string): StrategyType =>
-    s === 'EVEN_ODD' || s === 'RISE_FALL' ? 'EVEN_ODD' : 'DIGIT_OVER';
+    s === 'DCIRCLES_EVEN_ODD'
+      ? 'DCIRCLES_EVEN_ODD'
+      : s === 'EVEN_ODD' || s === 'RISE_FALL'
+        ? 'EVEN_ODD'
+        : 'DIGIT_OVER';
 
   const [selectedStrategy, setSelectedStrategy] = useState<StrategyType>(() => normalizeStrategy(settings.strategy));
   const [evenOddMode, setEvenOddMode] = useState<EvenOddMode>(settings.evenOddMode || 'reversal');
@@ -27,6 +31,9 @@ export function SettingsPanel() {
     const newSettings = {
       apiToken: settings.apiToken || '',
       appId: settings.appId || '1089',
+      authMethod: settings.authMethod,
+      activeAccountId: settings.activeAccountId,
+      accountCurrency: settings.accountCurrency,
       globalStake: Number(fd.get('globalStake')) || 1,
       targetStreak: Number(fd.get('targetStreak')) || settings.targetStreak || 3,
       takeProfit: Number(fd.get('takeProfit')) || 10,
@@ -79,11 +86,11 @@ export function SettingsPanel() {
                   <Binary size={12} className="text-[#00ff9c]" />
                   Trading Strategy
                 </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <button
                     type="button"
                     onClick={() => setSelectedStrategy('EVEN_ODD')}
-                    className={`p-3 rounded border text-left transition-all ${
+                    className={`p-3 rounded border text-left transition-all cursor-pointer ${
                       selectedStrategy === 'EVEN_ODD'
                         ? 'bg-[#38bdf8]/10 border-[#38bdf8] text-[#38bdf8]'
                         : 'bg-black/30 border-[#27272a] text-[#a1a1aa] hover:border-[#3f3f46]'
@@ -100,10 +107,28 @@ export function SettingsPanel() {
 
                   <button
                     type="button"
-                    onClick={() => setSelectedStrategy('DIGIT_OVER')}
-                    className={`p-3 rounded border text-left transition-all ${
-                      selectedStrategy === 'DIGIT_OVER'
+                    onClick={() => setSelectedStrategy('DCIRCLES_EVEN_ODD')}
+                    className={`p-3 rounded border text-left transition-all cursor-pointer ${
+                      selectedStrategy === 'DCIRCLES_EVEN_ODD'
                         ? 'bg-[#00ff9c]/10 border-[#00ff9c] text-[#00ff9c]'
+                        : 'bg-black/30 border-[#27272a] text-[#a1a1aa] hover:border-[#3f3f46]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between font-bold text-[12px]">
+                      <span>D-Circles Even / Odd</span>
+                      <CircleDot size={13} />
+                    </div>
+                    <p className="text-[10px] text-[#71717a] mt-1">
+                      If 5K Most &amp; Least digits are both Even (or both Odd), triggers on those two digits.
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setSelectedStrategy('DIGIT_OVER')}
+                    className={`p-3 rounded border text-left transition-all cursor-pointer ${
+                      selectedStrategy === 'DIGIT_OVER'
+                        ? 'bg-[#ffb000]/10 border-[#ffb000] text-[#ffb000]'
                         : 'bg-black/30 border-[#27272a] text-[#a1a1aa] hover:border-[#3f3f46]'
                     }`}
                   >
@@ -120,27 +145,38 @@ export function SettingsPanel() {
 
               {/* Streak & Strategy Parameters */}
               <div className="p-3.5 bg-black/40 border border-[#27272a] rounded space-y-3">
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] uppercase text-[#a1a1aa] font-semibold tracking-widest">
-                    {selectedStrategy === 'EVEN_ODD'
-                      ? 'Target Consecutive Even / Odd Streak'
-                      : 'Target Consecutive 0/1 Streak'}
-                  </label>
-                  <input 
-                    type="number" 
-                    name="targetStreak"
-                    defaultValue={settings.targetStreak}
-                    min="1"
-                    max="10"
-                    className="w-full bg-[#18181b] border border-[#27272a] text-[#00ff9c] px-3 py-2 outline-none text-right font-mono text-[12px] rounded focus:border-[#00ff9c]"
-                    required
-                  />
-                  <span className="text-[9px] text-[#71717a]">
-                    {selectedStrategy === 'EVEN_ODD'
-                      ? 'Triggers when consecutive Even or Odd digits reach this threshold.'
-                      : 'Triggers Over 1 contract when consecutive digits (0 or 1) reaches this threshold.'}
-                  </span>
-                </div>
+                {selectedStrategy === 'DCIRCLES_EVEN_ODD' ? (
+                  <div className="space-y-1.5">
+                    <div className="text-[10px] uppercase text-[#00ff9c] font-semibold tracking-widest">
+                      5,000-Tick D-Circles Entry Rule
+                    </div>
+                    <p className="text-[11px] text-[#a1a1aa] leading-relaxed">
+                      Analyzes the rolling last 5,000 ticks per market. When both the <strong className="text-[#e4e4e7]">Most</strong> and <strong className="text-[#e4e4e7]">Least</strong> appearing digits are <strong className="text-[#38bdf8]">Even</strong>, it enters <strong className="text-[#38bdf8]">DIGITEVEN</strong> whenever a tick lands on either of those two digits. When both are <strong className="text-[#ffb000]">Odd</strong>, it enters <strong className="text-[#ffb000]">DIGITODD</strong> on those two digits.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] uppercase text-[#a1a1aa] font-semibold tracking-widest">
+                      {selectedStrategy === 'EVEN_ODD'
+                        ? 'Target Consecutive Even / Odd Streak'
+                        : 'Target Consecutive 0/1 Streak'}
+                    </label>
+                    <input 
+                      type="number" 
+                      name="targetStreak"
+                      defaultValue={settings.targetStreak}
+                      min="1"
+                      max="10"
+                      className="w-full bg-[#18181b] border border-[#27272a] text-[#00ff9c] px-3 py-2 outline-none text-right font-mono text-[12px] rounded focus:border-[#00ff9c]"
+                      required
+                    />
+                    <span className="text-[9px] text-[#71717a]">
+                      {selectedStrategy === 'EVEN_ODD'
+                        ? 'Triggers when consecutive Even or Odd digits reach this threshold.'
+                        : 'Triggers Over 1 contract when consecutive digits (0 or 1) reaches this threshold.'}
+                    </span>
+                  </div>
+                )}
 
                 {selectedStrategy === 'EVEN_ODD' && (
                   <div className="space-y-1.5 pt-2 border-t border-[#27272a]/70">

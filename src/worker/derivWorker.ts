@@ -1,3 +1,5 @@
+import { evaluateDCirclesSignal } from '../utils/dCirclesStrategy';
+
 export type WorkerCommand = 
   | { type: 'INIT', settings: any }
   | { type: 'START', settings: any, sessionPnL: number }
@@ -7,6 +9,7 @@ export type WorkerCommand =
 
 const PUBLIC_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const HISTORY_SIZE = 20;
+const DCIRCLES_WINDOW_SIZE = 5000;
 
 interface MarketState {
   symbol: string;
@@ -18,6 +21,13 @@ interface MarketState {
   oddStreak: number;
   history: Int8Array;
   historyIndex: number;
+  ring5k: Uint8Array;
+  ring5kLen: number;
+  ring5kWriteIdx: number;
+  digitCounts5k: number[];
+  seeded5k: boolean;
+  seeding5k: boolean;
+  lastSeedEpoch: number | null;
 }
 
 const markets = [
@@ -39,7 +49,14 @@ markets.forEach(symbol => {
     evenStreak: 0,
     oddStreak: 0,
     history: new Int8Array(HISTORY_SIZE).fill(-1),
-    historyIndex: 0
+    historyIndex: 0,
+    ring5k: new Uint8Array(DCIRCLES_WINDOW_SIZE),
+    ring5kLen: 0,
+    ring5kWriteIdx: 0,
+    digitCounts5k: Array(10).fill(0),
+    seeded5k: false,
+    seeding5k: false,
+    lastSeedEpoch: null
   };
 });
 
@@ -49,6 +66,7 @@ let publicPingInterval: any = null;
 let isSubscribedToMarkets = false;
 const activeTickSymbols = new Set<string>();
 let tickSubIds: Record<string, string> = {};
+let historyReqIdToSymbol: Record<number, string> = {};
 
 let tradeWs: WebSocket | null = null;
 let tradePingInterval: any = null;
@@ -161,7 +179,57 @@ function resetMarketState(symbol: string) {
   st.oddStreak = 0;
   st.history.fill(-1);
   st.historyIndex = 0;
+  st.ring5kLen = 0;
+  st.ring5kWriteIdx = 0;
+  st.digitCounts5k.fill(0);
+  st.seeded5k = false;
+  st.seeding5k = false;
+  st.lastSeedEpoch = null;
   delete pendingUpdates[symbol];
+}
+
+function pushDigitTo5kWindow(state: MarketState, digit: number) {
+  if (digit < 0 || digit > 9) return;
+  if (state.ring5kLen < DCIRCLES_WINDOW_SIZE) {
+    state.ring5k[state.ring5kLen] = digit;
+    state.ring5kLen += 1;
+    state.digitCounts5k[digit] += 1;
+    if (state.ring5kLen === DCIRCLES_WINDOW_SIZE) {
+      state.ring5kWriteIdx = 0;
+    }
+  } else {
+    const evicted = state.ring5k[state.ring5kWriteIdx];
+    if (state.digitCounts5k[evicted] > 0) {
+      state.digitCounts5k[evicted] -= 1;
+    }
+    state.ring5k[state.ring5kWriteIdx] = digit;
+    state.ring5kWriteIdx = (state.ring5kWriteIdx + 1) % DCIRCLES_WINDOW_SIZE;
+    state.digitCounts5k[digit] += 1;
+  }
+}
+
+function seed5kHistoryIfNeeded() {
+  if (!publicWs || publicWs.readyState !== WebSocket.OPEN) return;
+  if (currentSettings?.strategy !== 'DCIRCLES_EVEN_ODD') return;
+
+  const targets = getSubscribedMarkets();
+  for (const symbol of targets) {
+    const st = marketStates[symbol];
+    if (!st || st.seeded5k || st.seeding5k) continue;
+    st.seeding5k = true;
+    const reqId = reqIdCounter++;
+    historyReqIdToSymbol[reqId] = symbol;
+    publicWs.send(
+      JSON.stringify({
+        ticks_history: symbol,
+        adjust_start_time: 1,
+        count: DCIRCLES_WINDOW_SIZE,
+        end: 'latest',
+        style: 'ticks',
+        req_id: reqId,
+      })
+    );
+  }
 }
 
 function subscribeSymbol(symbol: string) {
@@ -180,6 +248,7 @@ function connectPublicStream() {
   isSubscribedToMarkets = false;
   activeTickSymbols.clear();
   tickSubIds = {};
+  historyReqIdToSymbol = {};
   publicWs = new WebSocket(PUBLIC_WS_URL);
 
   publicWs.onopen = () => {
@@ -192,6 +261,7 @@ function connectPublicStream() {
 
     emit({ type: 'STATUS', status: 'connected' });
     subscribeToMarketData();
+    seed5kHistoryIfNeeded();
   };
 
   publicWs.onmessage = (msg) => {
@@ -203,7 +273,48 @@ function connectPublicStream() {
     }
 
     if (data.error) {
+      const reqId = data?.req_id || data?.echo_req?.req_id;
+      if (reqId && historyReqIdToSymbol[reqId]) {
+        const failedSym = historyReqIdToSymbol[reqId];
+        delete historyReqIdToSymbol[reqId];
+        if (marketStates[failedSym]) {
+          marketStates[failedSym].seeding5k = false;
+        }
+      }
       emit({ type: 'ERROR', message: data.error.message });
+      return;
+    }
+
+    if (data.msg_type === 'history' && data.history) {
+      const reqId = data?.req_id || data?.echo_req?.req_id;
+      const symbol = reqId ? historyReqIdToSymbol[reqId] : undefined;
+      if (reqId) delete historyReqIdToSymbol[reqId];
+      if (!symbol || !marketStates[symbol]) return;
+
+      const state = marketStates[symbol];
+      const rawPrices: Array<number | string> = data.history.prices || [];
+      const rawTimes: number[] = data.history.times || [];
+      const pipSize =
+        typeof data.pip_size === 'number' ? Number(data.pip_size) : state.pipSize;
+
+      const startIdx = Math.max(0, rawPrices.length - DCIRCLES_WINDOW_SIZE);
+      state.pipSize = pipSize;
+      state.ring5kLen = 0;
+      state.ring5kWriteIdx = 0;
+      state.digitCounts5k.fill(0);
+
+      for (let i = startIdx; i < rawPrices.length; i++) {
+        const p = Number(rawPrices[i]);
+        if (!Number.isFinite(p)) continue;
+        const d = Math.abs(Math.round(p * Math.pow(10, pipSize))) % 10;
+        pushDigitTo5kWindow(state, d);
+      }
+
+      const lastTime = rawTimes.length > 0 ? rawTimes[rawTimes.length - 1] : null;
+      state.lastSeedEpoch = typeof lastTime === 'number' ? lastTime : null;
+      state.seeded5k = state.ring5kLen > 0;
+      state.seeding5k = false;
+      queueUpdate(symbol, state);
       return;
     }
 
@@ -225,6 +336,10 @@ function connectPublicStream() {
     isSubscribedToMarkets = false;
     activeTickSymbols.clear();
     tickSubIds = {};
+    historyReqIdToSymbol = {};
+    markets.forEach((m) => {
+      marketStates[m].seeding5k = false;
+    });
     emit({ type: 'STATUS', status: 'disconnected' });
     setTimeout(connectPublicStream, 1500);
   };
@@ -274,6 +389,7 @@ function syncMarketSubscriptions() {
   for (const sym of toAdd) {
     subscribeSymbol(sym);
   }
+  seed5kHistoryIfNeeded();
 }
 
 /**
@@ -471,13 +587,28 @@ function handleTick(tickInfo: any) {
 
   const price = Number(tickInfo.quote);
   const pipSize = tickInfo.pip_size !== undefined ? Number(tickInfo.pip_size) : state.pipSize;
-  const digit = Math.round(price * Math.pow(10, pipSize)) % 10;
+  const digit = Math.abs(Math.round(price * Math.pow(10, pipSize))) % 10;
 
   state.price = price;
   state.pipSize = pipSize;
   state.digit = digit;
 
   emit({ type: 'DIGIT_STAT', digit });
+
+  // Evaluate D-Circles signal BEFORE absorbing this tick into the rolling 5K window
+  const dCirclesSignalBeforeTick = state.seeded5k
+    ? evaluateDCirclesSignal(state.digitCounts5k)
+    : null;
+
+  if (state.seeded5k) {
+    const epoch = tickInfo.epoch !== undefined ? Number(tickInfo.epoch) : null;
+    if (state.lastSeedEpoch !== null && epoch !== null && epoch <= state.lastSeedEpoch) {
+      // Skip overlapping seed boundary tick in the 5K ring buffer
+    } else {
+      state.lastSeedEpoch = null;
+      pushDigitTo5kWindow(state, digit);
+    }
+  }
 
   // Track Digit Over 1 streak (consecutive 0 or 1 digits)
   if (digit === 0 || digit === 1) {
@@ -506,7 +637,17 @@ function handleTick(tickInfo: any) {
     const targetStreak = currentSettings.targetStreak || 3;
 
     if (allowed && !isTradeActive && (now - lastTradeAttemptTime > 1000)) {
-      if (currentSettings.strategy === 'EVEN_ODD') {
+      if (currentSettings.strategy === 'DCIRCLES_EVEN_ODD') {
+        if (
+          state.seeded5k &&
+          dCirclesSignalBeforeTick?.contractType &&
+          dCirclesSignalBeforeTick.triggerDigits.includes(digit)
+        ) {
+          isTradeActive = true;
+          lastTradeAttemptTime = now;
+          executeEvenOdd(symbol, dCirclesSignalBeforeTick.contractType);
+        }
+      } else if (currentSettings.strategy === 'EVEN_ODD') {
         const mode = currentSettings.evenOddMode || 'reversal';
         if (state.evenStreak >= targetStreak) {
           state.evenStreak = 0;
@@ -537,6 +678,8 @@ function queueUpdate(symbol: string, state: MarketState) {
     unwrappedHistory[i] = state.history[(state.historyIndex + i) % HISTORY_SIZE];
   }
 
+  const dCirclesSignal = state.seeded5k ? evaluateDCirclesSignal(state.digitCounts5k) : null;
+
   pendingUpdates[symbol] = {
     currentPrice: state.price,
     pipSize: state.pipSize,
@@ -544,7 +687,10 @@ function queueUpdate(symbol: string, state: MarketState) {
     streak: state.streak,
     evenStreak: state.evenStreak,
     oddStreak: state.oddStreak,
-    streakHistory: unwrappedHistory
+    streakHistory: unwrappedHistory,
+    dCirclesTickCount: state.ring5kLen,
+    dCirclesMostDigits: dCirclesSignal ? dCirclesSignal.mostDigits : [],
+    dCirclesLeastDigits: dCirclesSignal ? dCirclesSignal.leastDigits : [],
   };
 
   if (!batchTimeout) {
@@ -729,7 +875,7 @@ function executeBuy(symbol: string) {
 
     cumulativeLoss += Math.abs(pnl);
 
-    const safeYield = (currentSettings?.strategy === 'EVEN_ODD') ? 0.95 : 0.21;
+    const safeYield = (currentSettings?.strategy === 'EVEN_ODD' || currentSettings?.strategy === 'DCIRCLES_EVEN_ODD') ? 0.95 : 0.21;
     const targetProfit = currentSettings.globalStake * safeYield;
     const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
     globalCurrentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
@@ -845,7 +991,7 @@ function handleContractUpdate(contract: any) {
       }
     } else {
       cumulativeLoss += Math.abs(batchPnL);
-      const safeYield = (currentSettings?.strategy === 'EVEN_ODD') ? 0.95 : 0.21;
+      const safeYield = (currentSettings?.strategy === 'EVEN_ODD' || currentSettings?.strategy === 'DCIRCLES_EVEN_ODD') ? 0.95 : 0.21;
       const targetProfit = currentSettings.globalStake * safeYield;
       const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
       globalCurrentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
@@ -896,6 +1042,7 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     connectPublicStream();
     if (publicWs && publicWs.readyState === WebSocket.OPEN) {
       syncMarketSubscriptions();
+      seed5kHistoryIfNeeded();
     }
     if (currentSettings?.apiToken) {
       connectTradeStream();
@@ -921,6 +1068,7 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
 
     if (publicWs && publicWs.readyState === WebSocket.OPEN) {
       syncMarketSubscriptions();
+      seed5kHistoryIfNeeded();
     }
 
     if (
@@ -959,6 +1107,7 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     isRunning = true;
     emit({ type: 'STATE_SYNC', isRunning: true, currentStake: globalCurrentStake, lastLostSymbol: null, isWaitingForRecovery: false });
     connectPublicStream();
+    seed5kHistoryIfNeeded();
     connectTradeStream();
   }
 

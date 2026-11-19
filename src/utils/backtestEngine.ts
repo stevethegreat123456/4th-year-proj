@@ -4,6 +4,7 @@ import {
   SYNTHETIC_MARKET_CATALOG,
   StrategyType,
 } from '../store/useStore';
+import { evaluateDCirclesSignal } from './dCirclesStrategy';
 
 const PUBLIC_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 
@@ -143,10 +144,17 @@ export async function fetchMarketsTickHistory(
 
     const resultsMap: Record<string, MarketTickSeries> = {};
     const errors: Record<string, string> = {};
+    const requestedCount = Math.min(Math.max(count, 100), 10000);
     const queue = [...uniqueSymbols];
     const inflight = new Map<
       number,
-      { symbol: string; timeoutId: ReturnType<typeof setTimeout>; attempts: number }
+      {
+        symbol: string;
+        timeoutId: ReturnType<typeof setTimeout>;
+        attempts: number;
+        phase: 1 | 2;
+        newerBatch?: { prices: Array<number | string>; times: number[]; pipSize: number };
+      }
     >();
 
     let reqCounter = 1000;
@@ -192,7 +200,41 @@ export async function fetchMarketsTickHistory(
       }
     };
 
-    const sendSymbolRequest = (symbol: string, attempts = 1) => {
+    const saveCombinedSeries = (
+      symbol: string,
+      olderPrices: Array<number | string>,
+      olderTimes: number[],
+      newerPrices: Array<number | string>,
+      newerTimes: number[],
+      pipSize: number
+    ) => {
+      const combinedRawPrices = [...olderPrices, ...newerPrices];
+      const combinedTimes = [...olderTimes, ...newerTimes];
+      const prices = combinedRawPrices.map((p) => Number(p));
+      const digits = combinedRawPrices.map((p) => extractLastDigit(p, pipSize));
+      const meta = getMarketMeta(symbol);
+
+      resultsMap[symbol] = {
+        symbol,
+        name: meta.name,
+        shortName: meta.shortName,
+        pipSize,
+        prices,
+        times: combinedTimes,
+        digits,
+        fetchedAt: Date.now(),
+      };
+      markDone(symbol);
+    };
+
+    const sendSymbolRequest = (
+      symbol: string,
+      attempts = 1,
+      phase: 1 | 2 = 1,
+      endParam: string | number = 'latest',
+      batchSize = Math.min(5000, requestedCount),
+      newerBatch?: { prices: Array<number | string>; times: number[]; pipSize: number }
+    ) => {
       if (finished || ws.readyState !== WebSocket.OPEN) return;
       const reqId = reqCounter++;
 
@@ -201,21 +243,24 @@ export async function fetchMarketsTickHistory(
         if (!current) return;
         inflight.delete(reqId);
         if (current.attempts < 2 && ws.readyState === WebSocket.OPEN) {
-          sendSymbolRequest(symbol, current.attempts + 1);
+          sendSymbolRequest(symbol, current.attempts + 1, phase, endParam, batchSize, newerBatch);
+        } else if (phase === 2 && newerBatch) {
+          // Gracefully keep first 5,000 ticks if older warmup batch timed out
+          saveCombinedSeries(symbol, [], [], newerBatch.prices, newerBatch.times, newerBatch.pipSize);
         } else {
           errors[symbol] = 'Timed out fetching tick history';
           markDone(symbol);
         }
       }, 15000);
 
-      inflight.set(reqId, { symbol, timeoutId, attempts });
+      inflight.set(reqId, { symbol, timeoutId, attempts, phase, newerBatch });
 
       ws.send(
         JSON.stringify({
           ticks_history: symbol,
           adjust_start_time: 1,
-          count: Math.min(Math.max(count, 100), 5000),
-          end: 'latest',
+          count: batchSize,
+          end: String(endParam),
           style: 'ticks',
           req_id: reqId,
         })
@@ -226,7 +271,7 @@ export async function fetchMarketsTickHistory(
       while (!finished && ws.readyState === WebSocket.OPEN && inflight.size < CONCURRENCY && queue.length > 0) {
         const nextSymbol = queue.shift();
         if (nextSymbol) {
-          sendSymbolRequest(nextSymbol, 1);
+          sendSymbolRequest(nextSymbol, 1, 1, 'latest', Math.min(5000, requestedCount));
         }
       }
     };
@@ -240,7 +285,7 @@ export async function fetchMarketsTickHistory(
         }
         finish();
       }
-    }, 60000);
+    }, 90000);
 
     ws.onopen = () => {
       onProgress?.({
@@ -268,6 +313,17 @@ export async function fetchMarketsTickHistory(
       inflight.delete(reqId);
 
       if (data.error) {
+        if (entry.phase === 2 && entry.newerBatch) {
+          saveCombinedSeries(
+            entry.symbol,
+            [],
+            [],
+            entry.newerBatch.prices,
+            entry.newerBatch.times,
+            entry.newerBatch.pipSize
+          );
+          return;
+        }
         errors[entry.symbol] = data.error.message || 'Deriv API error';
         markDone(entry.symbol);
         return;
@@ -280,22 +336,40 @@ export async function fetchMarketsTickHistory(
           ? data.pip_size
           : DEFAULT_PIP_SIZES[entry.symbol] ?? 2;
 
-      const prices = rawPrices.map((p) => Number(p));
-      const digits = rawPrices.map((p) => extractLastDigit(p, pipSize));
-      const meta = getMarketMeta(entry.symbol);
+      if (
+        entry.phase === 1 &&
+        requestedCount > 5000 &&
+        rawTimes.length > 0 &&
+        typeof rawTimes[0] === 'number'
+      ) {
+        const remaining = requestedCount - rawPrices.length;
+        if (remaining > 0) {
+          const olderEnd = rawTimes[0] - 1;
+          sendSymbolRequest(
+            entry.symbol,
+            1,
+            2,
+            olderEnd,
+            Math.min(5000, remaining),
+            { prices: rawPrices, times: rawTimes, pipSize }
+          );
+          return;
+        }
+      }
 
-      resultsMap[entry.symbol] = {
-        symbol: entry.symbol,
-        name: meta.name,
-        shortName: meta.shortName,
-        pipSize,
-        prices,
-        times: rawTimes,
-        digits,
-        fetchedAt: Date.now(),
-      };
+      if (entry.phase === 2 && entry.newerBatch) {
+        saveCombinedSeries(
+          entry.symbol,
+          rawPrices,
+          rawTimes,
+          entry.newerBatch.prices,
+          entry.newerBatch.times,
+          entry.newerBatch.pipSize
+        );
+        return;
+      }
 
-      markDone(entry.symbol);
+      saveCombinedSeries(entry.symbol, [], [], rawPrices, rawTimes, pipSize);
     };
 
     ws.onerror = () => {
@@ -339,15 +413,30 @@ export function simulateMarketBacktest(
   series: MarketTickSeries,
   config: BacktestConfig
 ): MarketBacktestResult {
-  const digits = series.digits.slice(-Math.max(100, config.tickCount));
-  const times = series.times.slice(-digits.length);
+  const isDCirclesStrategy = config.strategy === 'DCIRCLES_EVEN_ODD';
+  const testTickTarget = Math.max(100, config.tickCount || 5000);
+
+  // For DCIRCLES_EVEN_ODD, if series contains > testTickTarget ticks (e.g. 10,000 ticks),
+  // use the leading ticks as the exact 5,000-tick rolling warmup window and test the last 5,000 ticks.
+  const allDigits = series.digits;
+  const allTimes = series.times;
+  const warmupCount = isDCirclesStrategy
+    ? allDigits.length > testTickTarget
+      ? Math.min(5000, allDigits.length - testTickTarget)
+      : Math.min(1000, Math.floor(allDigits.length * 0.25))
+    : 0;
+
+  const digits = isDCirclesStrategy ? allDigits : allDigits.slice(-testTickTarget);
+  const times = isDCirclesStrategy ? allTimes : allTimes.slice(-digits.length);
+  const testedDigits = isDCirclesStrategy ? digits.slice(warmupCount) : digits;
+  const testedTimes = isDCirclesStrategy ? times.slice(warmupCount) : times;
 
   const digitCounts = Array(10).fill(0);
   let evenCount = 0;
   let oddCount = 0;
   let lowDigitCount = 0;
 
-  for (const d of digits) {
+  for (const d of testedDigits) {
     if (d >= 0 && d <= 9) {
       digitCounts[d] += 1;
       if (d % 2 === 0) evenCount += 1;
@@ -356,24 +445,28 @@ export function simulateMarketBacktest(
     }
   }
 
-  const n = digits.length || 1;
+  const n = testedDigits.length || 1;
   const timespanMinutes =
-    times.length >= 2 ? Math.max(1, (times[times.length - 1] - times[0]) / 60) : 0;
+    testedTimes.length >= 2
+      ? Math.max(1, (testedTimes[testedTimes.length - 1] - testedTimes[0]) / 60)
+      : 0;
 
   const targetStreak = Math.max(1, Math.min(10, Math.round(config.targetStreak || 3)));
   const baseStake = Math.max(0.35, Number(config.baseStake) || 1);
-  const safeYield = config.strategy === 'EVEN_ODD' ? 0.95 : 0.21;
+  const isEvenOddFamily =
+    config.strategy === 'EVEN_ODD' || config.strategy === 'DCIRCLES_EVEN_ODD';
+  const safeYield = isEvenOddFamily ? 0.95 : 0.21;
 
   let over1Streak = 0;
   let evenStreak = 0;
   let oddStreak = 0;
   let longestTriggerStreak = 0;
 
-  // Also track unconstrained streak lengths across all ticks for tail-risk visibility
+  // Also track unconstrained streak lengths across tested ticks for tail-risk visibility
   let rawOver1 = 0;
   let rawEven = 0;
   let rawOdd = 0;
-  for (const d of digits) {
+  for (const d of testedDigits) {
     if (d === 0 || d === 1) {
       rawOver1 += 1;
       if (config.strategy === 'DIGIT_OVER' && rawOver1 > longestTriggerStreak) {
@@ -386,13 +479,13 @@ export function simulateMarketBacktest(
     if (d % 2 === 0) {
       rawEven += 1;
       rawOdd = 0;
-      if (config.strategy === 'EVEN_ODD' && rawEven > longestTriggerStreak) {
+      if (isEvenOddFamily && rawEven > longestTriggerStreak) {
         longestTriggerStreak = rawEven;
       }
     } else {
       rawOdd += 1;
       rawEven = 0;
-      if (config.strategy === 'EVEN_ODD' && rawOdd > longestTriggerStreak) {
+      if (isEvenOddFamily && rawOdd > longestTriggerStreak) {
         longestTriggerStreak = rawOdd;
       }
     }
@@ -414,117 +507,220 @@ export function simulateMarketBacktest(
   const fullCurve: EquityPoint[] = [{ tradeIndex: 0, tickIndex: 0, equity: 0, drawdown: 0 }];
   const allTrades: SimulatedTrade[] = [];
 
-  for (let i = 0; i < digits.length - 1; i++) {
-    const d = digits[i];
+  if (isDCirclesStrategy) {
+    const WINDOW_LIMIT = 5000;
+    const windowBuf = new Uint8Array(WINDOW_LIMIT);
+    const windowCounts = Array(10).fill(0);
+    let windowLen = 0;
+    let windowWriteIdx = 0;
 
-    if (d === 0 || d === 1) {
-      over1Streak += 1;
-    } else {
-      over1Streak = 0;
-    }
-
-    if (d % 2 === 0) {
-      evenStreak += 1;
-      oddStreak = 0;
-    } else {
-      oddStreak += 1;
-      evenStreak = 0;
-    }
-
-    let contractType: 'DIGITEVEN' | 'DIGITODD' | 'DIGITOVER' | null = null;
-    if (config.strategy === 'EVEN_ODD') {
-      if (evenStreak >= targetStreak) {
-        contractType = config.evenOddMode === 'follow' ? 'DIGITEVEN' : 'DIGITODD';
-        evenStreak = 0;
-        oddStreak = 0;
-      } else if (oddStreak >= targetStreak) {
-        contractType = config.evenOddMode === 'follow' ? 'DIGITODD' : 'DIGITEVEN';
-        evenStreak = 0;
-        oddStreak = 0;
+    const pushToWindow = (digit: number) => {
+      if (digit < 0 || digit > 9) return;
+      if (windowLen < WINDOW_LIMIT) {
+        windowBuf[windowLen] = digit;
+        windowLen += 1;
+        windowCounts[digit] += 1;
+        if (windowLen === WINDOW_LIMIT) windowWriteIdx = 0;
+      } else {
+        const evicted = windowBuf[windowWriteIdx];
+        if (windowCounts[evicted] > 0) windowCounts[evicted] -= 1;
+        windowBuf[windowWriteIdx] = digit;
+        windowWriteIdx = (windowWriteIdx + 1) % WINDOW_LIMIT;
+        windowCounts[digit] += 1;
       }
-    } else {
-      if (over1Streak >= targetStreak) {
-        contractType = 'DIGITOVER';
-        over1Streak = 0;
-      }
+    };
+
+    for (let w = 0; w < warmupCount; w++) {
+      pushToWindow(digits[w]);
     }
 
-    if (contractType) {
-      // Settle on next tick (1-tick contract), mirroring live single-active-trade gate
-      const exitIdx = i + 1;
-      const exitDigit = digits[exitIdx];
-      const won =
-        contractType === 'DIGITOVER'
-          ? exitDigit > 1
-          : contractType === 'DIGITEVEN'
+    for (let i = warmupCount; i < digits.length - 1; i++) {
+      const d = digits[i];
+      const signal = evaluateDCirclesSignal(windowCounts);
+      pushToWindow(d);
+
+      if (signal.contractType && signal.triggerDigits.includes(d)) {
+        const exitIdx = i + 1;
+        const exitDigit = digits[exitIdx];
+        pushToWindow(exitDigit);
+
+        const won =
+          signal.contractType === 'DIGITEVEN'
             ? exitDigit % 2 === 0
             : exitDigit % 2 !== 0;
 
-      const stake = currentStake;
-      if (stake > maxStakeUsed) maxStakeUsed = stake;
+        const stake = currentStake;
+        if (stake > maxStakeUsed) maxStakeUsed = stake;
 
-      const pnl = won ? Number((stake * safeYield).toFixed(2)) : Number((-stake).toFixed(2));
+        const pnl = won ? Number((stake * safeYield).toFixed(2)) : Number((-stake).toFixed(2));
 
-      if (won) {
-        wins += 1;
-        grossProfit += pnl;
-        consecutiveLosses = 0;
-        cumulativeLoss = 0;
-        currentStake = baseStake;
-      } else {
-        losses += 1;
-        grossLoss += Math.abs(pnl);
-        consecutiveLosses += 1;
-        if (consecutiveLosses > maxConsecutiveLosses) {
-          maxConsecutiveLosses = consecutiveLosses;
-        }
-        cumulativeLoss += stake;
-        if (config.useRecovery) {
-          const targetProfit = baseStake * safeYield;
-          const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-          currentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
-        } else {
+        if (won) {
+          wins += 1;
+          grossProfit += pnl;
+          consecutiveLosses = 0;
+          cumulativeLoss = 0;
           currentStake = baseStake;
+        } else {
+          losses += 1;
+          grossLoss += Math.abs(pnl);
+          consecutiveLosses += 1;
+          if (consecutiveLosses > maxConsecutiveLosses) {
+            maxConsecutiveLosses = consecutiveLosses;
+          }
+          cumulativeLoss += stake;
+          if (config.useRecovery) {
+            const targetProfit = baseStake * safeYield;
+            const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
+            currentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
+          } else {
+            currentStake = baseStake;
+          }
+        }
+
+        equity = Number((equity + pnl).toFixed(2));
+        if (equity > peakEquity) peakEquity = equity;
+        const drawdown = Number(Math.max(0, peakEquity - equity).toFixed(2));
+        if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+
+        const tradeNum = wins + losses;
+        const relativeTickIdx = exitIdx - warmupCount;
+        fullCurve.push({
+          tradeIndex: tradeNum,
+          tickIndex: relativeTickIdx,
+          equity,
+          drawdown,
+        });
+
+        allTrades.push({
+          index: tradeNum,
+          tickIndex: relativeTickIdx,
+          timestamp: times[exitIdx] ? times[exitIdx] * 1000 : 0,
+          contractType: signal.contractType,
+          triggerDigits: signal.triggerDigits,
+          exitDigit,
+          stake,
+          won,
+          pnl,
+          equityAfter: equity,
+          drawdownAfter: drawdown,
+        });
+
+        i = exitIdx;
+      }
+    }
+  } else {
+    for (let i = 0; i < digits.length - 1; i++) {
+      const d = digits[i];
+
+      if (d === 0 || d === 1) {
+        over1Streak += 1;
+      } else {
+        over1Streak = 0;
+      }
+
+      if (d % 2 === 0) {
+        evenStreak += 1;
+        oddStreak = 0;
+      } else {
+        oddStreak += 1;
+        evenStreak = 0;
+      }
+
+      let contractType: 'DIGITEVEN' | 'DIGITODD' | 'DIGITOVER' | null = null;
+      if (config.strategy === 'EVEN_ODD') {
+        if (evenStreak >= targetStreak) {
+          contractType = config.evenOddMode === 'follow' ? 'DIGITEVEN' : 'DIGITODD';
+          evenStreak = 0;
+          oddStreak = 0;
+        } else if (oddStreak >= targetStreak) {
+          contractType = config.evenOddMode === 'follow' ? 'DIGITODD' : 'DIGITEVEN';
+          evenStreak = 0;
+          oddStreak = 0;
+        }
+      } else {
+        if (over1Streak >= targetStreak) {
+          contractType = 'DIGITOVER';
+          over1Streak = 0;
         }
       }
 
-      equity = Number((equity + pnl).toFixed(2));
-      if (equity > peakEquity) {
-        peakEquity = equity;
+      if (contractType) {
+        // Settle on next tick (1-tick contract), mirroring live single-active-trade gate
+        const exitIdx = i + 1;
+        const exitDigit = digits[exitIdx];
+        const won =
+          contractType === 'DIGITOVER'
+            ? exitDigit > 1
+            : contractType === 'DIGITEVEN'
+              ? exitDigit % 2 === 0
+              : exitDigit % 2 !== 0;
+
+        const stake = currentStake;
+        if (stake > maxStakeUsed) maxStakeUsed = stake;
+
+        const pnl = won ? Number((stake * safeYield).toFixed(2)) : Number((-stake).toFixed(2));
+
+        if (won) {
+          wins += 1;
+          grossProfit += pnl;
+          consecutiveLosses = 0;
+          cumulativeLoss = 0;
+          currentStake = baseStake;
+        } else {
+          losses += 1;
+          grossLoss += Math.abs(pnl);
+          consecutiveLosses += 1;
+          if (consecutiveLosses > maxConsecutiveLosses) {
+            maxConsecutiveLosses = consecutiveLosses;
+          }
+          cumulativeLoss += stake;
+          if (config.useRecovery) {
+            const targetProfit = baseStake * safeYield;
+            const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
+            currentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
+          } else {
+            currentStake = baseStake;
+          }
+        }
+
+        equity = Number((equity + pnl).toFixed(2));
+        if (equity > peakEquity) {
+          peakEquity = equity;
+        }
+        const drawdown = Number(Math.max(0, peakEquity - equity).toFixed(2));
+        if (drawdown > maxDrawdown) {
+          maxDrawdown = drawdown;
+        }
+
+        const tradeNum = wins + losses;
+        fullCurve.push({
+          tradeIndex: tradeNum,
+          tickIndex: exitIdx,
+          equity,
+          drawdown,
+        });
+
+        const startSlice = Math.max(0, i - targetStreak + 1);
+        allTrades.push({
+          index: tradeNum,
+          tickIndex: exitIdx,
+          timestamp: times[exitIdx] ? times[exitIdx] * 1000 : 0,
+          contractType,
+          triggerDigits: digits.slice(startSlice, i + 1),
+          exitDigit,
+          stake,
+          won,
+          pnl,
+          equityAfter: equity,
+          drawdownAfter: drawdown,
+        });
+
+        // Advance past settlement tick & reset streaks on the consumed settlement tick cleanly
+        over1Streak = 0;
+        evenStreak = 0;
+        oddStreak = 0;
+        i = exitIdx;
       }
-      const drawdown = Number(Math.max(0, peakEquity - equity).toFixed(2));
-      if (drawdown > maxDrawdown) {
-        maxDrawdown = drawdown;
-      }
-
-      const tradeNum = wins + losses;
-      fullCurve.push({
-        tradeIndex: tradeNum,
-        tickIndex: exitIdx,
-        equity,
-        drawdown,
-      });
-
-      const startSlice = Math.max(0, i - targetStreak + 1);
-      allTrades.push({
-        index: tradeNum,
-        tickIndex: exitIdx,
-        timestamp: times[exitIdx] ? times[exitIdx] * 1000 : 0,
-        contractType,
-        triggerDigits: digits.slice(startSlice, i + 1),
-        exitDigit,
-        stake,
-        won,
-        pnl,
-        equityAfter: equity,
-        drawdownAfter: drawdown,
-      });
-
-      // Advance past settlement tick & reset streaks on the consumed settlement tick cleanly
-      over1Streak = 0;
-      evenStreak = 0;
-      oddStreak = 0;
-      i = exitIdx;
     }
   }
 
@@ -578,7 +774,7 @@ export function simulateMarketBacktest(
     symbol: series.symbol,
     name: series.name,
     shortName: series.shortName,
-    tickCount: digits.length,
+    tickCount: testedDigits.length,
     timespanMinutes: Number(timespanMinutes.toFixed(1)),
     totalTrades,
     wins,

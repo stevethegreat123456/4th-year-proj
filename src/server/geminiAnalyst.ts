@@ -20,7 +20,7 @@ export interface BacktestMarketSummaryInput {
 
 export interface BacktestAIRequest {
   config: {
-    strategy: "EVEN_ODD" | "DIGIT_OVER";
+    strategy: "EVEN_ODD" | "DIGIT_OVER" | "DCIRCLES_EVEN_ODD";
     evenOddMode?: "reversal" | "follow";
     targetStreak: number;
     baseStake: number;
@@ -112,13 +112,15 @@ export async function analyzeBacktestWithGemini(
   }));
 
   const strategyDesc =
-    config.strategy === "EVEN_ODD"
-      ? `EVEN_ODD (${config.evenOddMode === "follow" ? "Follow Streak" : "Counter Streak"}, ~95% payout yield)`
-      : "DIGIT_OVER (Digit Over 1, ~21% payout yield)";
+    config.strategy === "DCIRCLES_EVEN_ODD"
+      ? "DCIRCLES_EVEN_ODD (5,000-tick Most & Least same-parity trigger, ~95% payout yield)"
+      : config.strategy === "EVEN_ODD"
+        ? `EVEN_ODD (${config.evenOddMode === "follow" ? "Follow Streak" : "Counter Streak"}, ~95% payout yield)`
+        : "DIGIT_OVER (Digit Over 1, ~21% payout yield)";
 
   const prompt = [
     `Analyze this ${config.tickCount}-tick backtest across ${compactMetrics.length} Deriv synthetic indices.`,
-    `Strategy: ${strategyDesc} | Streak: ${config.targetStreak} | Stake: $${config.baseStake.toFixed(2)} | Recovery: ${config.useRecovery ? "ON" : "OFF"}`,
+    `Strategy: ${strategyDesc} | ${config.strategy === "DCIRCLES_EVEN_ODD" ? "5K Rolling Most & Least Trigger" : `Streak: ${config.targetStreak}`} | Stake: $${config.baseStake.toFixed(2)} | Recovery: ${config.useRecovery ? "ON" : "OFF"}`,
     ``,
     `Ranked metrics:`,
     JSON.stringify(compactMetrics),

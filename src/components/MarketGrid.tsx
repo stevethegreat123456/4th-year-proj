@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
 import { useStore, MarketData, ALL_MARKET_SYMBOLS, EvenOddMode } from '../store/useStore';
-import { Target, Check, Filter, AlertTriangle, Radio, Binary } from 'lucide-react';
+import { Target, Check, Filter, AlertTriangle, Radio, Binary, CircleDot, X } from 'lucide-react';
 import { MarketMultiSelect } from './MarketMultiSelect';
 
 export function MarketGrid() {
   const markets = useStore((state) => state.markets);
   const settings = useStore((state) => state.settings);
   const toggleMarketSelection = useStore((state) => state.toggleMarketSelection);
+  const toggleSubscribedMarket = useStore((state) => state.toggleSubscribedMarket);
   const setSelectedMarkets = useStore((state) => state.setSelectedMarkets);
   const setSubscribedMarkets = useStore((state) => state.setSubscribedMarkets);
   const lastLostSymbol = useStore((state) => state.lastLostSymbol);
@@ -14,6 +15,7 @@ export function MarketGrid() {
   const [showSelectedOnly, setShowSelectedOnly] = useState(false);
 
   const isEvenOdd = settings.strategy === 'EVEN_ODD';
+  const isDCirclesEvenOdd = settings.strategy === 'DCIRCLES_EVEN_ODD';
   const evenOddMode: EvenOddMode = settings.evenOddMode || 'reversal';
   const connectionStatus = useStore((state) => state.connectionStatus);
 
@@ -39,7 +41,12 @@ export function MarketGrid() {
       {/* Unified Compact Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 bg-[#111114] border border-[#27272a] px-3 sm:px-4 py-2 rounded-lg text-[11px] font-mono">
         <div className="flex flex-wrap items-center gap-2">
-          {isEvenOdd ? (
+          {isDCirclesEvenOdd ? (
+            <span className="bg-[#00ff9c]/10 text-[#00ff9c] border border-[#00ff9c]/30 px-2 py-0.5 rounded font-bold flex items-center gap-1.5 whitespace-nowrap">
+              <CircleDot size={12} />
+              D-CIRCLES EVEN/ODD · 5K MOST &amp; LEAST
+            </span>
+          ) : isEvenOdd ? (
             <span className="bg-[#38bdf8]/10 text-[#38bdf8] border border-[#38bdf8]/30 px-2 py-0.5 rounded font-bold flex items-center gap-1.5 whitespace-nowrap">
               <Binary size={12} />
               EVEN/ODD · {settings.targetStreak || 3} · {evenOddMode === 'follow' ? 'FOLLOW' : 'COUNTER'}
@@ -172,12 +179,14 @@ export function MarketGrid() {
               key={market.symbol}
               market={market}
               isEvenOdd={isEvenOdd}
+              isDCirclesEvenOdd={isDCirclesEvenOdd}
               evenOddMode={evenOddMode}
               targetStreak={settings.targetStreak || 3}
               lastLostSymbol={lastLostSymbol}
               isWaitingForRecovery={isWaitingForRecovery}
               isSelected={selectedMarkets.includes(market.symbol)}
               onToggleSelect={() => toggleMarketSelection(market.symbol)}
+              onRemove={() => toggleSubscribedMarket(market.symbol)}
             />
           ))}
         </div>
@@ -190,23 +199,27 @@ export function MarketGrid() {
 interface MarketCardProps {
   market: MarketData;
   isEvenOdd: boolean;
+  isDCirclesEvenOdd: boolean;
   evenOddMode: EvenOddMode;
   targetStreak: number;
   lastLostSymbol: string | null;
   isWaitingForRecovery: boolean;
   isSelected: boolean;
   onToggleSelect: () => void;
+  onRemove: () => void;
 }
 
 const MarketCard: React.FC<MarketCardProps> = ({ 
   market, 
   isEvenOdd,
+  isDCirclesEvenOdd,
   evenOddMode,
   targetStreak, 
   lastLostSymbol, 
   isWaitingForRecovery,
   isSelected,
-  onToggleSelect
+  onToggleSelect,
+  onRemove
 }) => {
   const history = market.streakHistory.slice(-20);
   while (history.length < 20) history.unshift(-1);
@@ -217,9 +230,28 @@ const MarketCard: React.FC<MarketCardProps> = ({
   const activeParityStreak = activeParity === 'even' ? evenStreak : activeParity === 'odd' ? oddStreak : 0;
 
   const currentStreakValue = isEvenOdd ? activeParityStreak : market.streak;
-  const isCloseToTarget = currentStreakValue >= targetStreak - 1 && currentStreakValue < targetStreak;
-  const isTargetMet = currentStreakValue >= targetStreak;
+  const isCloseToTarget = !isDCirclesEvenOdd && currentStreakValue >= targetStreak - 1 && currentStreakValue < targetStreak;
+  const isTargetMet = !isDCirclesEvenOdd && currentStreakValue >= targetStreak;
   const inRecoveryThisSymbol = isWaitingForRecovery && lastLostSymbol === market.symbol;
+
+  const mostDigits = market.dCirclesMostDigits || [];
+  const leastDigits = market.dCirclesLeastDigits || [];
+  const dCirclesTickCount = market.dCirclesTickCount || 0;
+  const dCirclesAllEven =
+    mostDigits.length > 0 &&
+    leastDigits.length > 0 &&
+    mostDigits.every((d) => d % 2 === 0) &&
+    leastDigits.every((d) => d % 2 === 0);
+  const dCirclesAllOdd =
+    mostDigits.length > 0 &&
+    leastDigits.length > 0 &&
+    mostDigits.every((d) => d % 2 !== 0) &&
+    leastDigits.every((d) => d % 2 !== 0);
+  const dCirclesDirection: 'EVEN' | 'ODD' | null = dCirclesAllEven
+    ? 'EVEN'
+    : dCirclesAllOdd
+      ? 'ODD'
+      : null;
 
   const targetContractLabel = activeParity === 'even'
     ? (evenOddMode === 'follow' ? 'EVEN' : 'ODD')
@@ -229,11 +261,13 @@ const MarketCard: React.FC<MarketCardProps> = ({
     <div className={`bg-[#111114] border rounded-lg p-3.5 flex flex-col gap-2.5 transition-all ${
       inRecoveryThisSymbol 
         ? 'border-[#ff4b4b] ring-1 ring-[#ff4b4b]' 
-        : isTargetMet && isSelected
-          ? (isEvenOdd ? 'border-[#38bdf8]' : 'border-[#ff4b4b]')
-          : isCloseToTarget && isSelected
-            ? 'border-[#ffb000]/50' 
-            : 'border-[#27272a]'
+        : isDCirclesEvenOdd && isSelected && dCirclesDirection
+          ? (dCirclesDirection === 'EVEN' ? 'border-[#38bdf8]/70' : 'border-[#ffb000]/70')
+          : isTargetMet && isSelected
+            ? (isEvenOdd ? 'border-[#38bdf8]' : 'border-[#ff4b4b]')
+            : isCloseToTarget && isSelected
+              ? 'border-[#ffb000]/50' 
+              : 'border-[#27272a]'
     } ${!isSelected ? 'opacity-65 hover:opacity-90' : ''}`}>
       
       {/* Header */}
@@ -247,25 +281,36 @@ const MarketCard: React.FC<MarketCardProps> = ({
           )}
         </div>
         
-        <button
-          type="button"
-          onClick={onToggleSelect}
-          title={isSelected ? 'Trading enabled (click to switch to Watch Only)' : 'Watch Only (click to enable trading)'}
-          className={`shrink-0 text-[10px] px-2 py-0.5 rounded border font-mono font-bold flex items-center gap-1 transition-colors cursor-pointer ${
-            isSelected
-              ? 'bg-[#00ff9c]/10 border-[#00ff9c]/40 text-[#00ff9c] hover:bg-[#00ff9c]/20'
-              : 'bg-white/5 border-[#27272a] text-[#71717a] hover:text-[#e4e4e7] hover:border-[#3f3f46]'
-          }`}
-        >
-          {isSelected ? (
-            <>
-              <Check size={10} strokeWidth={3} />
-              TRADING
-            </>
-          ) : (
-            <>WATCH</>
-          )}
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={onToggleSelect}
+            title={isSelected ? 'Trading enabled (click to switch to Watch Only)' : 'Watch Only (click to enable trading)'}
+            className={`shrink-0 text-[10px] px-2 py-0.5 rounded border font-mono font-bold flex items-center gap-1 transition-colors cursor-pointer ${
+              isSelected
+                ? 'bg-[#00ff9c]/10 border-[#00ff9c]/40 text-[#00ff9c] hover:bg-[#00ff9c]/20'
+                : 'bg-white/5 border-[#27272a] text-[#71717a] hover:text-[#e4e4e7] hover:border-[#3f3f46]'
+            }`}
+          >
+            {isSelected ? (
+              <>
+                <Check size={10} strokeWidth={3} />
+                TRADING
+              </>
+            ) : (
+              <>WATCH</>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            title={`Remove ${market.name}`}
+            aria-label={`Remove ${market.name}`}
+            className="shrink-0 p-1 rounded border border-[#27272a] bg-white/5 text-[#71717a] hover:text-[#ff4b4b] hover:border-[#ff4b4b]/50 hover:bg-[#ff4b4b]/10 transition-colors cursor-pointer"
+          >
+            <X size={11} />
+          </button>
+        </div>
       </div>
       
       {/* Live Price */}
@@ -273,8 +318,62 @@ const MarketCard: React.FC<MarketCardProps> = ({
         {market.currentPrice === 0 ? '---.----' : market.currentPrice.toFixed(4)}
       </div>
 
-      {/* Even / Odd Streak Indicator */}
-      {isEvenOdd ? (
+      {/* Strategy Indicator */}
+      {isDCirclesEvenOdd ? (
+        <>
+          <div className="grid grid-cols-10 gap-1">
+            {history.map((digit, i) => {
+              if (digit === -1) {
+                return (
+                  <div key={i} className="h-5 sm:h-6 flex items-center justify-center font-mono text-[10px] sm:text-[11px] rounded bg-white/5 border border-[#27272a]" />
+                );
+              }
+              const isMostDigit = mostDigits.includes(digit);
+              const isLeastDigit = leastDigits.includes(digit);
+              return (
+                <div
+                  key={i}
+                  title={isMostDigit ? `${digit} (Most 5K)` : isLeastDigit ? `${digit} (Least 5K)` : `${digit}`}
+                  className={`h-5 sm:h-6 flex items-center justify-center font-mono text-[10px] sm:text-[11px] rounded border tabular-nums ${
+                    isMostDigit
+                      ? 'bg-[#00ff9c]/20 text-[#00ff9c] border-[#00ff9c]'
+                      : isLeastDigit
+                        ? 'bg-[#ff4b4b]/20 text-[#ff4b4b] border-[#ff4b4b]'
+                        : 'bg-white/5 border-[#27272a] text-[#a1a1aa]'
+                  }`}
+                >
+                  {digit}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between gap-2 mt-0.5 text-[10px] font-mono tabular-nums">
+            {dCirclesTickCount === 0 ? (
+              <span className="text-[#71717a]">Seeding 5,000 ticks...</span>
+            ) : (
+              <>
+                <span className="text-[#a1a1aa]">
+                  Most <strong className="text-[#00ff9c]">{mostDigits.join(',')}</strong>
+                  {' · '}
+                  Least <strong className="text-[#ff4b4b]">{leastDigits.join(',')}</strong>
+                </span>
+                <span
+                  className={`font-bold uppercase tracking-wider ${
+                    dCirclesDirection === 'EVEN'
+                      ? 'text-[#38bdf8]'
+                      : dCirclesDirection === 'ODD'
+                        ? 'text-[#ffb000]'
+                        : 'text-[#71717a]'
+                  }`}
+                >
+                  {dCirclesDirection ? `TRIG ${dCirclesDirection}` : 'WAIT'}
+                </span>
+              </>
+            )}
+          </div>
+        </>
+      ) : isEvenOdd ? (
         <>
           <div className="grid grid-cols-10 gap-1">
             {history.map((digit, i) => {
