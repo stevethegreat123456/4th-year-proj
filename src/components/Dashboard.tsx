@@ -11,6 +11,7 @@ import { io, Socket } from 'socket.io-client';
 import { Activity, AlertTriangle, FlaskConical, X } from 'lucide-react';
 
 import { DerivAuth } from './DerivAuth';
+import { getAuthInfo, getStoredOAuthClientId, refreshAccessToken, DEFAULT_APP_ID } from '../utils/derivAuth';
 
 function sanitizeSettingsForServer(settings: any) {
   if (!settings || typeof settings !== 'object') return settings;
@@ -128,6 +129,38 @@ export function Dashboard() {
       } else if (msg.type === 'AUTH_SUCCESS') {
         useStore.getState().updateFromDerivAuth(msg.account);
         setAlertBanner(null);
+      } else if (msg.type === 'TOKEN_EXPIRED') {
+        const storedInfo = getAuthInfo(true);
+        const clientId =
+          getStoredOAuthClientId() ||
+          useStore.getState().auth.appId ||
+          useStore.getState().settings.appId ||
+          DEFAULT_APP_ID;
+        if (storedInfo?.refresh_token && clientId) {
+          refreshAccessToken(storedInfo.refresh_token, clientId)
+            .then((refreshed) => {
+              const updatedSettings = {
+                ...useStore.getState().settings,
+                apiToken: refreshed.access_token,
+                authMethod: 'oauth' as const,
+              };
+              useStore.getState().setSettings(updatedSettings);
+              workerRef.current?.postMessage({ type: 'UPDATE_SETTINGS', settings: updatedSettings });
+            })
+            .catch(() => {
+              setIsPending(false);
+              setAlertBanner({
+                type: 'warning',
+                message: 'Deriv session expired. Please log in again.',
+              });
+            });
+        } else {
+          setIsPending(false);
+          setAlertBanner({
+            type: 'warning',
+            message: 'Deriv session expired. Please log in again.',
+          });
+        }
       } else if (msg.type === 'AUTH_ERROR') {
         setIsPending(false);
         setAlertBanner({

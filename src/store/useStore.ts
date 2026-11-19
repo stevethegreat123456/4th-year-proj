@@ -1,5 +1,13 @@
 import { create } from 'zustand';
-import { DerivAccount, DEFAULT_APP_ID } from '../utils/derivAuth';
+import {
+  DerivAccount,
+  DEFAULT_APP_ID,
+  getAuthInfo,
+  getActiveLoginId,
+  setActiveLoginId,
+  setAccountType,
+  clearAllAuthData,
+} from '../utils/derivAuth';
 
 export type { DerivAccount };
 
@@ -76,6 +84,9 @@ export const ALL_MARKET_SYMBOLS = [
 export interface Settings {
   apiToken: string;
   appId?: string;
+  authMethod?: 'oauth' | 'pat';
+  activeAccountId?: string;
+  accountCurrency?: string;
   globalStake: number;
   targetStreak: number;
   takeProfit: number;
@@ -141,7 +152,7 @@ interface AppState {
   setCurrentStake: (stake: number) => void;
 }
 
-// Hydrate stored accounts and active account from localStorage
+// Hydrate stored accounts, auth_info, and active account from localStorage
 const getInitialAuth = (): AuthState => {
   if (typeof window === 'undefined') {
     return {
@@ -155,14 +166,22 @@ const getInitialAuth = (): AuthState => {
   try {
     const rawAccounts = localStorage.getItem('deriv_accounts');
     const rawActive = localStorage.getItem('deriv_active_account');
-    const storedAppId = localStorage.getItem('deriv_app_id') || DEFAULT_APP_ID;
+    const activeLoginId = getActiveLoginId();
+    const authInfo = getAuthInfo(true);
+    const storedAppId =
+      localStorage.getItem('oauth_client_id') ||
+      localStorage.getItem('deriv_app_id') ||
+      DEFAULT_APP_ID;
     const manualToken = localStorage.getItem('deriv_api_token') || '';
 
     const accounts: DerivAccount[] = rawAccounts ? JSON.parse(rawAccounts) : [];
     let activeAccount: DerivAccount | null = rawActive ? JSON.parse(rawActive) : null;
 
     if (!activeAccount && accounts.length > 0) {
-      activeAccount = accounts.find(a => a.isVirtual) || accounts[0];
+      activeAccount =
+        (activeLoginId ? accounts.find(a => (a.account_id || a.account) === activeLoginId) : undefined) ||
+        accounts.find(a => a.isVirtual) ||
+        accounts[0];
     } else if (!activeAccount && manualToken) {
       activeAccount = {
         account: 'Manual Token',
@@ -172,8 +191,12 @@ const getInitialAuth = (): AuthState => {
       };
     }
 
+    if (activeAccount && authInfo?.access_token && !activeAccount.token) {
+      activeAccount = { ...activeAccount, token: authInfo.access_token };
+    }
+
     return {
-      isLoggedIn: !!activeAccount?.token,
+      isLoggedIn: !!(activeAccount?.token || authInfo?.access_token),
       activeAccount,
       accounts,
       appId: storedAppId
@@ -189,11 +212,12 @@ const getInitialAuth = (): AuthState => {
 };
 
 const initialAuth = getInitialAuth();
+const initialOAuthInfo = typeof window !== 'undefined' ? getAuthInfo(true) : null;
 
 export const useStore = create<AppState>()((set) => ({
   connectionStatus: 'disconnected',
   setConnectionStatus: (status) => set({ connectionStatus: status }),
-  balance: null,
+  balance: initialAuth.activeAccount?.balance ?? null,
   setBalance: (balance) => set({ balance }),
   auth: initialAuth,
   setAuth: (newAuth) =>
@@ -201,35 +225,60 @@ export const useStore = create<AppState>()((set) => ({
       const mergedAuth = { ...state.auth, ...newAuth };
       if (typeof window !== 'undefined') {
         if (mergedAuth.accounts) localStorage.setItem('deriv_accounts', JSON.stringify(mergedAuth.accounts));
-        if (mergedAuth.activeAccount) localStorage.setItem('deriv_active_account', JSON.stringify(mergedAuth.activeAccount));
+        if (mergedAuth.activeAccount) {
+          localStorage.setItem('deriv_active_account', JSON.stringify(mergedAuth.activeAccount));
+          const loginId = mergedAuth.activeAccount.account_id || mergedAuth.activeAccount.account;
+          if (loginId && loginId !== 'Deriv' && loginId !== 'Manual Token') {
+            setActiveLoginId(loginId);
+            setAccountType(mergedAuth.activeAccount.isVirtual ? 'demo' : 'real');
+          }
+        }
         if (mergedAuth.appId) localStorage.setItem('deriv_app_id', mergedAuth.appId);
       }
       return { auth: mergedAuth };
     }),
   switchAccount: (account: DerivAccount) =>
     set((state) => {
+      const loginId = account.account_id || account.account;
+      const authInfo = typeof window !== 'undefined' ? getAuthInfo(true) : null;
+      const resolvedToken = account.token || authInfo?.access_token || state.settings.apiToken;
+      const resolvedAccount: DerivAccount = { ...account, token: resolvedToken };
+      const isOAuthAccount = Boolean(account.account_type || authInfo?.access_token);
+
       if (typeof window !== 'undefined') {
-        localStorage.setItem('deriv_active_account', JSON.stringify(account));
+        localStorage.setItem('deriv_active_account', JSON.stringify(resolvedAccount));
+        if (loginId) {
+          setActiveLoginId(loginId);
+          setAccountType(account.isVirtual ? 'demo' : 'real');
+        }
       }
-      const newSettings = { ...state.settings, apiToken: account.token };
+      const newSettings: Settings = {
+        ...state.settings,
+        apiToken: resolvedToken,
+        authMethod: isOAuthAccount ? 'oauth' : 'pat',
+        activeAccountId: loginId,
+        accountCurrency: account.currency || 'USD',
+      };
       window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: newSettings }));
       return {
         auth: {
           ...state.auth,
-          activeAccount: account,
+          activeAccount: resolvedAccount,
           isLoggedIn: true
         },
-        settings: newSettings
+        settings: newSettings,
+        balance: account.balance !== undefined ? account.balance : state.balance
       };
     }),
   logout: () =>
     set((state) => {
-      if (typeof window !== 'undefined') {
-        localStorage.removeItem('deriv_accounts');
-        localStorage.removeItem('deriv_active_account');
-        localStorage.removeItem('deriv_api_token');
-      }
-      const newSettings = { ...state.settings, apiToken: '' };
+      clearAllAuthData();
+      const newSettings: Settings = {
+        ...state.settings,
+        apiToken: '',
+        authMethod: undefined,
+        activeAccountId: undefined,
+      };
       window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: newSettings }));
       return {
         auth: {
@@ -268,8 +317,11 @@ export const useStore = create<AppState>()((set) => ({
       };
     }),
   settings: {
-    apiToken: initialAuth.activeAccount?.token || '',
+    apiToken: initialAuth.activeAccount?.token || initialOAuthInfo?.access_token || '',
     appId: initialAuth.appId || DEFAULT_APP_ID,
+    authMethod: (initialOAuthInfo?.access_token || initialAuth.activeAccount?.account_type) ? 'oauth' : 'pat',
+    activeAccountId: initialAuth.activeAccount?.account_id || initialAuth.activeAccount?.account || (typeof window !== 'undefined' ? getActiveLoginId() || undefined : undefined),
+    accountCurrency: initialAuth.activeAccount?.currency || 'USD',
     globalStake: 1,
     targetStreak: 3,
     takeProfit: 10,

@@ -65,21 +65,34 @@ async function startServer() {
     }
   });
 
-  // Deriv OAuth 2.0 PKCE token exchange endpoint
+  // Deriv OAuth 2.0 PKCE token exchange & refresh endpoint
   app.post("/api/deriv/oauth/token", async (req, res) => {
-    const { code, code_verifier, client_id, redirect_uri } = req.body;
-    if (!code || !code_verifier || !client_id) {
-      return res.status(400).json({ error: "Missing required parameters (code, code_verifier, client_id)" });
+    const { grant_type, code, code_verifier, refresh_token, client_id, redirect_uri } = req.body || {};
+    const grantType = grant_type || "authorization_code";
+
+    if (!client_id) {
+      return res.status(400).json({ error: "Missing required parameter: client_id" });
     }
 
     try {
       const formParams = new URLSearchParams();
-      formParams.append("grant_type", "authorization_code");
+      formParams.append("grant_type", grantType);
       formParams.append("client_id", String(client_id));
-      formParams.append("code", String(code));
-      formParams.append("code_verifier", String(code_verifier));
-      if (redirect_uri) {
-        formParams.append("redirect_uri", String(redirect_uri));
+
+      if (grantType === "refresh_token") {
+        if (!refresh_token) {
+          return res.status(400).json({ error: "Missing required parameter: refresh_token" });
+        }
+        formParams.append("refresh_token", String(refresh_token));
+      } else {
+        if (!code || !code_verifier) {
+          return res.status(400).json({ error: "Missing required parameters (code, code_verifier)" });
+        }
+        formParams.append("code", String(code));
+        formParams.append("code_verifier", String(code_verifier));
+        if (redirect_uri) {
+          formParams.append("redirect_uri", String(redirect_uri));
+        }
       }
 
       const tokenRes = await fetch("https://auth.deriv.com/oauth2/token", {
@@ -90,7 +103,13 @@ async function startServer() {
         body: formParams.toString()
       });
 
-      const data = await tokenRes.json();
+      const text = await tokenRes.text();
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { error: "invalid_response", error_description: text };
+      }
       return res.status(tokenRes.status).json(data);
     } catch (err: any) {
       console.error("Deriv OAuth token exchange error:", err);

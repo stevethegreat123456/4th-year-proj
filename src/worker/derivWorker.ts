@@ -53,6 +53,8 @@ let tickSubIds: Record<string, string> = {};
 let tradeWs: WebSocket | null = null;
 let tradePingInterval: any = null;
 let fallbackToDefaultAppId = false;
+let isOtpSocket = false;
+let isConnectingTrade = false;
 
 let isRunning = false;
 let currentSettings: any = null;
@@ -275,34 +277,87 @@ function syncMarketSubscriptions() {
 }
 
 /**
- * 2. Authenticated Trading WebSocket (Only connects when an API token is configured)
+ * 2. Authenticated Trading WebSocket (Supports both Deriv Options OTP WebSocket & Legacy PAT WebSocket)
  */
+const OPTIONS_API_BASE = 'https://api.derivws.com/trading/v1/options';
+
 function getTradeWsUrl(): string {
   const appId = fallbackToDefaultAppId ? '1089' : (currentSettings?.appId || '1089');
   return `wss://ws.derivws.com/websockets/v3?app_id=${appId}`;
 }
 
-function connectTradeStream() {
+async function fetchOtpWebSocketUrl(accessToken: string, accountId: string): Promise<string> {
+  const res = await fetch(`${OPTIONS_API_BASE}/accounts/${encodeURIComponent(accountId)}/otp`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (res.status === 401) {
+    emit({ type: 'TOKEN_EXPIRED' });
+    throw new Error('OAuth session expired. Refreshing authentication...');
+  }
+
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok || !payload?.data?.url) {
+    const errMsg =
+      payload?.errors?.[0]?.message ||
+      payload?.error?.message ||
+      payload?.message ||
+      `Failed to get WebSocket OTP (${res.status})`;
+    throw new Error(errMsg);
+  }
+  return payload.data.url;
+}
+
+async function connectTradeStream() {
   if (!currentSettings?.apiToken) {
     if (tradeWs) {
       try { tradeWs.close(); } catch (e) {}
       tradeWs = null;
     }
+    isConnectingTrade = false;
     return;
   }
 
-  if (tradeWs && (tradeWs.readyState === WebSocket.OPEN || tradeWs.readyState === WebSocket.CONNECTING)) {
+  if (isConnectingTrade || (tradeWs && (tradeWs.readyState === WebSocket.OPEN || tradeWs.readyState === WebSocket.CONNECTING))) {
     return;
+  }
+
+  isConnectingTrade = true;
+  const useOtpFlow = currentSettings?.authMethod === 'oauth' && Boolean(currentSettings?.activeAccountId);
+
+  let wsUrl = '';
+  if (useOtpFlow) {
+    try {
+      wsUrl = await fetchOtpWebSocketUrl(currentSettings.apiToken, currentSettings.activeAccountId);
+      isOtpSocket = true;
+    } catch (err: any) {
+      isConnectingTrade = false;
+      emit({ type: 'AUTH_ERROR', message: err?.message || 'Failed to authenticate trading WebSocket' });
+      return;
+    }
+  } else {
+    isOtpSocket = false;
+    wsUrl = getTradeWsUrl();
   }
 
   try {
-    tradeWs = new WebSocket(getTradeWsUrl());
+    tradeWs = new WebSocket(wsUrl);
   } catch (e) {
-    fallbackToDefaultAppId = true;
-    tradeWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+    isConnectingTrade = false;
+    if (!useOtpFlow) {
+      fallbackToDefaultAppId = true;
+      tradeWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+    } else {
+      emit({ type: 'AUTH_ERROR', message: 'Failed to open Deriv OTP WebSocket' });
+      return;
+    }
   }
 
   tradeWs.onopen = () => {
+    isConnectingTrade = false;
     fallbackToDefaultAppId = false;
     if (tradePingInterval) clearInterval(tradePingInterval);
     tradePingInterval = setInterval(() => {
@@ -311,13 +366,18 @@ function connectTradeStream() {
       }
     }, 15000);
 
-    if (currentSettings?.apiToken) {
+    if (isOtpSocket) {
+      // OTP WebSocket is already authenticated for the selected account
+      tradeWs?.send('{"balance":1,"subscribe":1}');
+      tradeWs?.send('{"proposal_open_contract":1,"subscribe":1}');
+    } else if (currentSettings?.apiToken) {
       tradeWs?.send(JSON.stringify({ authorize: currentSettings.apiToken }));
     }
   };
 
   tradeWs.onerror = () => {
-    if (currentSettings?.appId && currentSettings.appId !== '1089' && !fallbackToDefaultAppId) {
+    isConnectingTrade = false;
+    if (!isOtpSocket && currentSettings?.appId && currentSettings.appId !== '1089' && !fallbackToDefaultAppId) {
       fallbackToDefaultAppId = true;
     }
   };
@@ -352,8 +412,8 @@ function connectTradeStream() {
 
     if (data.msg_type === 'authorize') {
       if (data.authorize && data.authorize.balance !== undefined) {
-        currentBalance = data.authorize.balance;
-        emit({ type: 'BALANCE', balance: data.authorize.balance });
+        currentBalance = Number(data.authorize.balance) || 0;
+        emit({ type: 'BALANCE', balance: currentBalance });
       }
       emit({
         type: 'AUTH_SUCCESS',
@@ -370,8 +430,11 @@ function connectTradeStream() {
       tradeWs?.send('{"balance":1,"subscribe":1}');
       tradeWs?.send('{"proposal_open_contract":1,"subscribe":1}');
     } else if (data.msg_type === 'balance') {
-      currentBalance = data.balance.balance;
-      emit({ type: 'BALANCE', balance: data.balance.balance });
+      const balVal = Number(data.balance?.balance ?? data.balance);
+      if (!Number.isNaN(balVal)) {
+        currentBalance = balVal;
+        emit({ type: 'BALANCE', balance: balVal });
+      }
     } else if (data.msg_type === 'buy') {
       handleBuy(data.buy, data.echo_req);
     } else if (data.msg_type === 'proposal_open_contract') {
@@ -382,6 +445,7 @@ function connectTradeStream() {
   };
 
   tradeWs.onclose = () => {
+    isConnectingTrade = false;
     if (tradePingInterval) clearInterval(tradePingInterval);
     tradeWs = null;
     if (currentSettings?.apiToken) {
@@ -504,18 +568,25 @@ function executeEvenOdd(symbol: string, contractType: 'DIGITEVEN' | 'DIGITODD') 
   batchSymbol = symbol;
   reqIdToSymbol[reqId] = symbol;
 
+  const currency = currentSettings?.accountCurrency || 'USD';
+  const buyParameters: Record<string, any> = {
+    amount: stake,
+    basis: 'stake',
+    contract_type: contractType,
+    currency,
+    duration: 1,
+    duration_unit: 't',
+  };
+  if (isOtpSocket) {
+    buyParameters.underlying_symbol = symbol;
+  } else {
+    buyParameters.symbol = symbol;
+  }
+
   tradeWs.send(JSON.stringify({
     buy: 1,
     price: stake,
-    parameters: {
-      amount: stake,
-      basis: 'stake',
-      contract_type: contractType,
-      currency: 'USD',
-      duration: 1,
-      duration_unit: 't',
-      symbol: symbol
-    },
+    parameters: buyParameters,
     req_id: reqId
   }));
 
@@ -597,9 +668,28 @@ function executeBuy(symbol: string) {
   reqIdToSymbol[reqId] = symbol;
 
   const barrier = '1';
-  const rawPayloadString = `{"buy":1,"price":${stake},"parameters":{"amount":${stake},"basis":"stake","contract_type":"DIGITOVER","currency":"USD","duration":1,"duration_unit":"t","symbol":"${symbol}","barrier":"${barrier}"},"req_id":${reqId}}`;
+  const currency = currentSettings?.accountCurrency || 'USD';
+  const buyParameters: Record<string, any> = {
+    amount: stake,
+    basis: 'stake',
+    contract_type: 'DIGITOVER',
+    currency,
+    duration: 1,
+    duration_unit: 't',
+    barrier,
+  };
+  if (isOtpSocket) {
+    buyParameters.underlying_symbol = symbol;
+  } else {
+    buyParameters.symbol = symbol;
+  }
 
-  tradeWs.send(rawPayloadString);
+  tradeWs.send(JSON.stringify({
+    buy: 1,
+    price: stake,
+    parameters: buyParameters,
+    req_id: reqId
+  }));
 
   emit({
     type: 'TRADE_INIT',
@@ -817,6 +907,10 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     const newToken = data.settings?.apiToken;
     const prevAppId = currentSettings?.appId || '1089';
     const newAppId = data.settings?.appId || '1089';
+    const prevAccountId = currentSettings?.activeAccountId;
+    const newAccountId = data.settings?.activeAccountId;
+    const prevAuthMethod = currentSettings?.authMethod;
+    const newAuthMethod = data.settings?.authMethod;
 
     currentSettings = data.settings;
     if (cumulativeLoss === 0 && !isTradeActive) {
@@ -829,7 +923,12 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
       syncMarketSubscriptions();
     }
 
-    if (newToken !== prevToken || newAppId !== prevAppId) {
+    if (
+      newToken !== prevToken ||
+      newAppId !== prevAppId ||
+      newAccountId !== prevAccountId ||
+      newAuthMethod !== prevAuthMethod
+    ) {
       if (tradeWs) {
         try { tradeWs.close(); } catch (err) {}
         tradeWs = null;
