@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { useStore, DerivAccount } from '../store/useStore';
 import { 
   parseDerivOAuthParams, 
-  launchDerivLogin, 
   launchDerivPKCELogin,
   exchangeDerivCodeForToken,
   DEFAULT_APP_ID 
@@ -469,14 +468,14 @@ export function DerivAuth() {
     } catch (e) {}
   }, []);
 
-  const handleOAuthRedirect = () => {
-    const appIdToUse = customAppId.trim() || DEFAULT_APP_ID;
-    setAuth({ appId: appIdToUse });
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('deriv_app_id', appIdToUse);
-    }
-    launchDerivLogin(appIdToUse);
-  };
+  useEffect(() => {
+    const handleOpenLogin = () => {
+      setAuthError(null);
+      setIsModalOpen(true);
+    };
+    window.addEventListener('open_deriv_login_modal', handleOpenLogin);
+    return () => window.removeEventListener('open_deriv_login_modal', handleOpenLogin);
+  }, []);
 
   const handlePKCELogin = async () => {
     const appIdToUse = customAppId.trim() || DEFAULT_APP_ID;
@@ -757,23 +756,13 @@ export function DerivAuth() {
               <div className="space-y-2.5">
                 <button
                   type="button"
-                  onClick={handleOAuthRedirect}
+                  onClick={handlePKCELogin}
                   disabled={isExchangingCode}
-                  className="w-full flex items-center justify-center gap-2 bg-[#ff444f] hover:bg-[#ff555e] text-white py-2.5 px-3 rounded-lg font-bold text-xs transition-all"
+                  className="w-full flex items-center justify-center gap-2 bg-[#ff444f] hover:bg-[#ff555e] text-white py-2.5 px-3 rounded-lg font-bold text-xs transition-all cursor-pointer"
                 >
                   <LogIn size={14} />
                   <span>Continue with Deriv</span>
                   <ExternalLink size={12} className="opacity-80" />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handlePKCELogin}
-                  disabled={isExchangingCode}
-                  className="w-full flex items-center justify-center gap-2 bg-[#18181b] hover:bg-[#27272a] border border-[#27272a] text-[#e4e4e7] py-2 px-3 rounded-lg text-[11px] font-semibold transition-all"
-                >
-                  <span>Deriv OAuth 2.0 (PKCE)</span>
-                  <ExternalLink size={11} className="opacity-60" />
                 </button>
 
                 <div className="flex items-center justify-between gap-2 pt-1">
@@ -828,16 +817,6 @@ export function DerivAuth() {
                     <span>Get Token</span>
                     <ExternalLink size={10} />
                   </a>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] text-[#71717a]">App ID:</span>
-                    <input
-                      type="text"
-                      value={customAppId}
-                      onChange={(e) => setCustomAppId(e.target.value.trim())}
-                      placeholder="1089"
-                      className="w-20 bg-black/50 border border-[#27272a] text-[#e4e4e7] px-2 py-1 rounded text-[11px] text-right outline-none focus:border-[#00ff9c]"
-                    />
-                  </div>
                 </div>
 
                 <button

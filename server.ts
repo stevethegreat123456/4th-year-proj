@@ -7,6 +7,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { startBotEngine, initBot } from "./src/server/botEngine.ts";
 import { initSupabase } from "./src/server/supabase.ts";
+import { analyzeBacktestWithGemini } from "./src/server/geminiAnalyst.ts";
 
 dotenv.config();
 
@@ -18,7 +19,7 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
   
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: "1mb" }));
 
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
@@ -32,6 +33,29 @@ async function startServer() {
 
   app.get("/ping", (req, res) => {
     res.send("Bot is running!");
+  });
+
+  // Server-side Gemini AI backtest risk & market selection endpoint
+  app.post("/api/backtest/ai-analyze", async (req, res) => {
+    const { config, results } = req.body || {};
+    if (!config || !Array.isArray(results) || results.length === 0) {
+      return res.status(400).json({ error: "Missing backtest config or market results." });
+    }
+
+    try {
+      const analysis = await analyzeBacktestWithGemini({ config, results });
+      return res.json({ analysis });
+    } catch (err: any) {
+      console.error("Backtest AI analysis error:", err);
+      const status = err?.statusCode || err?.status || 500;
+      const message =
+        status === 400 || status === 403
+          ? "Gemini API authentication failed. Please verify GEMINI_API_KEY in Settings > Secrets."
+          : status === 429
+            ? "Gemini API quota exceeded. Please retry shortly or check your billing tier in Settings > Secrets."
+            : err?.message || "Failed to generate AI backtest analysis.";
+      return res.status(status).json({ error: message });
+    }
   });
 
   // Deriv OAuth 2.0 PKCE token exchange endpoint

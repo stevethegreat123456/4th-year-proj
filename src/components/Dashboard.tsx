@@ -5,10 +5,18 @@ import { HistoryPanel } from './HistoryPanel';
 import { MarketGrid } from './MarketGrid';
 import { TradeLog } from './TradeLog';
 import { StatsPanel } from './StatsPanel';
+import { BacktestLab } from './BacktestLab';
 import { useWakeLock } from '../hooks/useWakeLock';
 import { io, Socket } from 'socket.io-client';
+import { Activity, AlertTriangle, FlaskConical, X } from 'lucide-react';
 
 import { DerivAuth } from './DerivAuth';
+
+function sanitizeSettingsForServer(settings: any) {
+  if (!settings || typeof settings !== 'object') return settings;
+  const { apiToken: _stripped, ...safeSettings } = settings;
+  return safeSettings;
+}
 
 export function Dashboard() {
   useWakeLock();
@@ -18,6 +26,11 @@ export function Dashboard() {
   const workerRef = useRef<Worker | null>(null);
 
   const [isPending, setIsPending] = React.useState(false);
+  const [activeView, setActiveView] = React.useState<'live' | 'backtest'>('live');
+  const [alertBanner, setAlertBanner] = React.useState<{
+    type: 'error' | 'warning' | 'info';
+    message: string;
+  } | null>(null);
   const isRunning = useStore((state) => state.isRunning);
   const setIsRunning = useStore((state) => state.setIsRunning);
   const settings = useStore((state) => state.settings);
@@ -72,6 +85,9 @@ export function Dashboard() {
         if (msg.isWaitingForRecovery !== undefined) {
           useStore.getState().setIsWaitingForRecovery(msg.isWaitingForRecovery);
         }
+        if (msg.currentStake !== undefined) {
+          useStore.getState().setCurrentStake(msg.currentStake);
+        }
       } else if (msg.type === 'SCHEDULE_START') {
         useStore.getState().setIsRunning(true);
       } else if (msg.type === 'SCHEDULE_STOP') {
@@ -79,6 +95,12 @@ export function Dashboard() {
       } else if (msg.type === 'LIMIT_REACHED') {
         useStore.getState().setIsRunning(false);
         useStore.getState().saveAndResetSession();
+        if (msg.message) {
+          setAlertBanner({
+            type: msg.message.toLowerCase().includes('profit') ? 'info' : 'warning',
+            message: msg.message,
+          });
+        }
       } else if (msg.type === 'DIGIT_STAT') {
         incrementDigit(msg.digit);
       } else if (msg.type === 'STATUS') {
@@ -87,10 +109,19 @@ export function Dashboard() {
         setBalance(msg.balance);
       } else if (msg.type === 'AUTH_SUCCESS') {
         useStore.getState().updateFromDerivAuth(msg.account);
+        setAlertBanner(null);
       } else if (msg.type === 'AUTH_ERROR') {
-        console.warn('Deriv Auth Error:', msg.message);
+        setIsPending(false);
+        setAlertBanner({
+          type: 'error',
+          message: `Deriv Auth Error: ${msg.message || 'Authentication failed'}`,
+        });
       } else if (msg.type === 'ERROR') {
-        console.warn('Deriv WS Error:', msg.message);
+        setIsPending(false);
+        setAlertBanner({
+          type: 'error',
+          message: msg.message || 'Deriv WebSocket error occurred.',
+        });
       }
     };
 
@@ -114,19 +145,29 @@ export function Dashboard() {
       if (data.currentSettings !== undefined && data.currentSettings !== null && !isInitialized.current) {
         const localSettings = useStore.getState().settings;
         const hasLocalMarketPrefs = typeof window !== 'undefined' && localStorage.getItem('deriv_selected_markets') !== null;
+        const hasLocalSubscribedPrefs = typeof window !== 'undefined' && localStorage.getItem('deriv_subscribed_markets') !== null;
+        const legacySelectedMarket = data.currentSettings.selectedMarket;
+        const serverSelectedMarkets = Array.isArray(data.currentSettings.selectedMarkets)
+          ? data.currentSettings.selectedMarkets
+          : legacySelectedMarket && legacySelectedMarket !== 'ALL' && legacySelectedMarket !== 'CUSTOM'
+            ? [legacySelectedMarket]
+            : localSettings.selectedMarkets;
         const resolvedSelectedMarkets = hasLocalMarketPrefs
           ? localSettings.selectedMarkets
-          : Array.isArray(data.currentSettings.selectedMarkets)
-            ? data.currentSettings.selectedMarkets
-            : localSettings.selectedMarkets;
+          : serverSelectedMarkets;
+        const resolvedSubscribedMarkets = hasLocalSubscribedPrefs
+          ? localSettings.subscribedMarkets
+          : Array.isArray(data.currentSettings.subscribedMarkets)
+            ? data.currentSettings.subscribedMarkets
+            : localSettings.subscribedMarkets;
+        const { apiToken: _ignoredServerToken, selectedMarket: _ignoredLegacyMarket, ...safeServerSettings } =
+          data.currentSettings;
         const merged = {
-          ...data.currentSettings,
-          apiToken: localSettings.apiToken || data.currentSettings.apiToken || '',
+          ...safeServerSettings,
+          apiToken: localSettings.apiToken || '',
           appId: localSettings.appId || data.currentSettings.appId || '1089',
           selectedMarkets: resolvedSelectedMarkets,
-          selectedMarket: hasLocalMarketPrefs
-            ? localSettings.selectedMarket
-            : (data.currentSettings.selectedMarket || localSettings.selectedMarket)
+          subscribedMarkets: resolvedSubscribedMarkets
         };
         useStore.getState().setSettings(merged);
         workerRef.current?.postMessage({ type: 'UPDATE_SETTINGS', settings: merged });
@@ -160,7 +201,10 @@ export function Dashboard() {
   useEffect(() => {
     const handleSettingsChange = (e: any) => {
       workerRef.current?.postMessage({ type: 'UPDATE_SETTINGS', settings: e.detail });
-      socketRef.current?.emit('worker_command', { type: 'UPDATE_SETTINGS', settings: e.detail });
+      socketRef.current?.emit('worker_command', {
+        type: 'UPDATE_SETTINGS',
+        settings: sanitizeSettingsForServer(e.detail)
+      });
     };
     const handleVirtualTopup = () => {
       workerRef.current?.postMessage({ type: 'TOPUP' });
@@ -174,6 +218,12 @@ export function Dashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!alertBanner) return;
+    const timer = setTimeout(() => setAlertBanner(null), 8000);
+    return () => clearTimeout(timer);
+  }, [alertBanner]);
+
   const connectionStatus = useStore((state) => state.connectionStatus);
 
   return (
@@ -181,7 +231,7 @@ export function Dashboard() {
       <header className="h-[56px] sm:h-[64px] border-b border-[#27272a] bg-[#111114] px-3 sm:px-6 flex justify-between items-center shrink-0">
         <div className="flex items-center gap-2 sm:gap-4 overflow-x-auto whitespace-nowrap scrollbar-hide">
           <div className="font-extrabold text-[14px] sm:text-[18px] tracking-tight text-[#00ff9c] flex items-center shrink-0">
-            DERIV<span className="hidden sm:inline text-[#e4e4e7] ml-1">HF-BOT_v4</span>
+            DERIV<span className="hidden sm:inline text-[#e4e4e7] ml-1">BOT</span>
           </div>
           <div className="flex items-center gap-1 sm:gap-2 text-[10px] sm:text-xs font-mono shrink-0">
             <div className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${connectionStatus === 'connected' ? 'bg-[#00ff9c] shadow-[0_0_8px_#00ff9c]' : 'bg-[#ff4b4b]'}`} />
@@ -190,16 +240,31 @@ export function Dashboard() {
             </span>
           </div>
 
-          <div className="hidden md:flex items-center ml-2 shrink-0 font-mono text-[10px]">
-            {settings.strategy === 'RISE_FALL' ? (
-              <span className="bg-[#00ff9c]/10 text-[#00ff9c] border border-[#00ff9c]/30 px-2 py-0.5 rounded font-bold">
-                RISE/FALL ({settings.timeframe ? (settings.timeframe >= 60 ? `${settings.timeframe / 60}m` : `${settings.timeframe}s`) : '1m'})
-              </span>
-            ) : (
-              <span className="bg-[#ffb000]/10 text-[#ffb000] border border-[#ffb000]/30 px-2 py-0.5 rounded font-bold">
-                OVER 1 (STREAK: {settings.targetStreak || 3})
-              </span>
-            )}
+          <div className="flex items-center bg-[#09090b] border border-[#27272a] rounded-md p-0.5 font-mono text-[11px] shrink-0">
+            <button
+              type="button"
+              onClick={() => setActiveView('live')}
+              className={`px-2.5 py-1 rounded flex items-center gap-1.5 font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                activeView === 'live'
+                  ? 'bg-[#27272a] text-[#00ff9c]'
+                  : 'text-[#a1a1aa] hover:text-[#e4e4e7]'
+              }`}
+            >
+              <Activity size={12} />
+              <span>Live Monitor</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveView('backtest')}
+              className={`px-2.5 py-1 rounded flex items-center gap-1.5 font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                activeView === 'backtest'
+                  ? 'bg-[#27272a] text-[#38bdf8]'
+                  : 'text-[#a1a1aa] hover:text-[#e4e4e7]'
+              }`}
+            >
+              <FlaskConical size={12} />
+              <span>5K Backtester</span>
+            </button>
           </div>
         </div>
         <div className="flex gap-2 sm:gap-4 items-center shrink-0 ml-2">
@@ -215,35 +280,77 @@ export function Dashboard() {
               if (nextState) {
                   if (!settings.apiToken) {
                       setIsPending(false);
+                      setAlertBanner({
+                        type: 'warning',
+                        message: 'Log in with your Deriv account or paste an API token to start trading.',
+                      });
+                      window.dispatchEvent(new CustomEvent('open_deriv_login_modal'));
                       return;
                   }
+                  setAlertBanner(null);
                   workerRef.current?.postMessage({ type: 'START', settings, sessionPnL: useStore.getState().sessionPnL });
-                  socketRef.current?.emit('worker_command', { type: 'START', settings, sessionPnL: useStore.getState().sessionPnL });
+                  socketRef.current?.emit('worker_command', {
+                    type: 'START',
+                    settings: sanitizeSettingsForServer(settings),
+                    sessionPnL: useStore.getState().sessionPnL
+                  });
               } else {
                   workerRef.current?.postMessage({ type: 'STOP' });
                   socketRef.current?.emit('worker_command', { type: 'STOP' });
               }
             }}
-            className={`px-3 py-1.5 sm:px-6 sm:py-2 rounded font-bold text-[10px] sm:text-sm transition-colors whitespace-nowrap ${isPending ? 'opacity-50 cursor-not-allowed bg-gray-500 text-white' : isRunning ? 'bg-[#ff4b4b] text-[#e4e4e7]' : 'bg-[#00ff9c] text-[#09090b]'}`}
+            className={`px-3 py-1.5 sm:px-6 sm:py-2 rounded font-bold text-[10px] sm:text-sm transition-colors whitespace-nowrap cursor-pointer ${isPending ? 'opacity-50 cursor-not-allowed bg-gray-500 text-white' : isRunning ? 'bg-[#ff4b4b] text-[#e4e4e7]' : 'bg-[#00ff9c] text-[#09090b]'}`}
           >
             {isPending ? '...' : isRunning ? 'HALT' : 'START'}
           </button>
         </div>
       </header>
 
-      <main className="flex-1 flex flex-col lg:flex-row overflow-hidden pb-[env(safe-area-inset-bottom)]">
-        <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="flex-1 overflow-y-auto p-3 sm:p-5">
-            <MarketGrid />
+      {alertBanner && (
+        <div
+          role="alert"
+          className={`px-4 py-2 border-b text-xs font-mono flex items-center justify-between gap-3 shrink-0 ${
+            alertBanner.type === 'error'
+              ? 'bg-[#ff4b4b]/10 border-[#ff4b4b]/30 text-[#ff4b4b]'
+              : alertBanner.type === 'warning'
+                ? 'bg-[#ffb000]/10 border-[#ffb000]/30 text-[#ffb000]'
+                : 'bg-[#00ff9c]/10 border-[#00ff9c]/30 text-[#00ff9c]'
+          }`}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle size={14} className="shrink-0" />
+            <span className="truncate">{alertBanner.message}</span>
           </div>
-          <div className="shrink-0 h-[120px] sm:h-[140px]">
-            <TradeLog />
-          </div>
+          <button
+            type="button"
+            onClick={() => setAlertBanner(null)}
+            className="opacity-75 hover:opacity-100 p-0.5 cursor-pointer shrink-0"
+            aria-label="Dismiss alert"
+          >
+            <X size={14} />
+          </button>
         </div>
+      )}
 
-        <div className="w-full lg:w-[300px] xl:w-[320px] shrink-0 border-t lg:border-t-0 lg:border-l border-[#27272a] bg-[#111114] p-3 sm:p-5 overflow-y-auto">
-          <StatsPanel />
-        </div>
+      <main className="flex-1 flex flex-col lg:flex-row overflow-hidden pb-[env(safe-area-inset-bottom)]">
+        {activeView === 'backtest' ? (
+          <BacktestLab />
+        ) : (
+          <>
+            <div className="flex-1 flex flex-col overflow-hidden">
+              <div className="flex-1 overflow-y-auto p-3 sm:p-5">
+                <MarketGrid />
+              </div>
+              <div className="shrink-0 h-[120px] sm:h-[140px]">
+                <TradeLog />
+              </div>
+            </div>
+
+            <div className="w-full lg:w-[300px] xl:w-[320px] shrink-0 border-t lg:border-t-0 lg:border-l border-[#27272a] bg-[#111114] p-3 sm:p-5 overflow-y-auto">
+              <StatsPanel />
+            </div>
+          </>
+        )}
       </main>
     </div>
   );

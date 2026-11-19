@@ -3,16 +3,8 @@ import { DerivAccount, DEFAULT_APP_ID } from '../utils/derivAuth';
 
 export type { DerivAccount };
 
-export type StrategyType = 'DIGIT_OVER' | 'RISE_FALL';
-
-export interface CandleData {
-  epoch: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  trend: 'bullish' | 'bearish' | 'neutral';
-}
+export type StrategyType = 'DIGIT_OVER' | 'EVEN_ODD';
+export type EvenOddMode = 'reversal' | 'follow';
 
 export interface MarketData {
   symbol: string;
@@ -20,16 +12,9 @@ export interface MarketData {
   currentPrice: number;
   currentDigit: number;
   streak: number;
+  evenStreak: number;
+  oddStreak: number;
   streakHistory: number[];
-  candleOpen?: number;
-  candleHigh?: number;
-  candleLow?: number;
-  candleClose?: number;
-  prevCandleOpen?: number;
-  prevCandleClose?: number;
-  prevCandleTrend?: 'bullish' | 'bearish' | 'neutral';
-  candleTimeRemaining?: number;
-  candleHistory?: CandleData[];
 }
 
 export interface Trade {
@@ -56,6 +41,31 @@ export interface TradingSession {
   tradeLog: Trade[];
 }
 
+export const SYNTHETIC_MARKET_CATALOG: Array<{
+  symbol: string;
+  name: string;
+  shortName: string;
+  group: 'volatility' | '1s' | 'jump' | 'daily';
+}> = [
+  { symbol: 'R_10', name: 'Volatility 10 Index', shortName: 'Volatility 10', group: 'volatility' },
+  { symbol: 'R_25', name: 'Volatility 25 Index', shortName: 'Volatility 25', group: 'volatility' },
+  { symbol: 'R_50', name: 'Volatility 50 Index', shortName: 'Volatility 50', group: 'volatility' },
+  { symbol: 'R_75', name: 'Volatility 75 Index', shortName: 'Volatility 75', group: 'volatility' },
+  { symbol: 'R_100', name: 'Volatility 100 Index', shortName: 'Volatility 100', group: 'volatility' },
+  { symbol: '1HZ10V', name: 'Volatility 10 (1s) Index', shortName: 'Volatility 10 (1s)', group: '1s' },
+  { symbol: '1HZ25V', name: 'Volatility 25 (1s) Index', shortName: 'Volatility 25 (1s)', group: '1s' },
+  { symbol: '1HZ50V', name: 'Volatility 50 (1s) Index', shortName: 'Volatility 50 (1s)', group: '1s' },
+  { symbol: '1HZ75V', name: 'Volatility 75 (1s) Index', shortName: 'Volatility 75 (1s)', group: '1s' },
+  { symbol: '1HZ100V', name: 'Volatility 100 (1s) Index', shortName: 'Volatility 100 (1s)', group: '1s' },
+  { symbol: 'JD10', name: 'Jump 10 Index', shortName: 'Jump 10', group: 'jump' },
+  { symbol: 'JD25', name: 'Jump 25 Index', shortName: 'Jump 25', group: 'jump' },
+  { symbol: 'JD50', name: 'Jump 50 Index', shortName: 'Jump 50', group: 'jump' },
+  { symbol: 'JD75', name: 'Jump 75 Index', shortName: 'Jump 75', group: 'jump' },
+  { symbol: 'JD100', name: 'Jump 100 Index', shortName: 'Jump 100', group: 'jump' },
+  { symbol: 'RDBEAR', name: 'Bear Market Index', shortName: 'Bear Market', group: 'daily' },
+  { symbol: 'RDBULL', name: 'Bull Market Index', shortName: 'Bull Market', group: 'daily' }
+];
+
 export const ALL_MARKET_SYMBOLS = [
   'R_10', 'R_25', 'R_50', 'R_75', 'R_100',
   '1HZ10V', '1HZ25V', '1HZ50V', '1HZ75V', '1HZ100V',
@@ -74,11 +84,9 @@ export interface Settings {
   startTime: string;
   stopTime: string;
   strategy: StrategyType;
-  timeframe: number; // candle granularity in seconds (60, 120, 180, 300, 600, 900, 1800, 3600)
-  tradeDuration: number;
-  tradeDurationUnit: 'm' | 't' | 's';
-  selectedMarket: string; // 'ALL' or specific symbol (legacy fallback)
+  evenOddMode: EvenOddMode;
   selectedMarkets: string[]; // Explicit list of enabled symbols to trade on
+  subscribedMarkets: string[]; // Explicit list of indices subscribed for live tick streaming
 }
 
 export interface AuthState {
@@ -99,6 +107,8 @@ interface AppState {
   setSettings: (settings: Partial<Settings>) => void;
   toggleMarketSelection: (symbol: string) => void;
   setSelectedMarkets: (symbols: string[]) => void;
+  toggleSubscribedMarket: (symbol: string) => void;
+  setSubscribedMarkets: (symbols: string[]) => void;
   auth: AuthState;
   setAuth: (auth: Partial<AuthState>) => void;
   switchAccount: (account: DerivAccount) => void;
@@ -127,6 +137,8 @@ interface AppState {
   setLastLostSymbol: (symbol: string | null) => void;
   isWaitingForRecovery: boolean;
   setIsWaitingForRecovery: (isWaiting: boolean) => void;
+  currentStake: number;
+  setCurrentStake: (stake: number) => void;
 }
 
 // Hydrate stored accounts and active account from localStorage
@@ -266,10 +278,7 @@ export const useStore = create<AppState>()((set) => ({
     startTime: '08:00',
     stopTime: '17:00',
     strategy: 'DIGIT_OVER',
-    timeframe: 60,
-    tradeDuration: 1,
-    tradeDurationUnit: 'm',
-    selectedMarket: 'ALL',
+    evenOddMode: 'reversal',
     selectedMarkets: (() => {
       if (typeof window !== 'undefined') {
         try {
@@ -281,15 +290,54 @@ export const useStore = create<AppState>()((set) => ({
         } catch (e) {}
       }
       return [...ALL_MARKET_SYMBOLS];
+    })(),
+    subscribedMarkets: (() => {
+      if (typeof window !== 'undefined') {
+        try {
+          const saved = localStorage.getItem('deriv_subscribed_markets');
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed)) return parsed;
+          }
+        } catch (e) {}
+      }
+      return [...ALL_MARKET_SYMBOLS];
     })()
   },
   setSettings: (newSettings) =>
     set((state) => {
-      const merged = { ...state.settings, ...newSettings };
-      if (typeof window !== 'undefined' && Array.isArray(merged.selectedMarkets)) {
-        localStorage.setItem('deriv_selected_markets', JSON.stringify(merged.selectedMarkets));
+      const legacyPayload = newSettings as Partial<Settings> & { selectedMarket?: string };
+      const normalizedStrategy: StrategyType =
+        (newSettings.strategy as string) === 'RISE_FALL'
+          ? 'EVEN_ODD'
+          : (newSettings.strategy || state.settings.strategy || 'DIGIT_OVER');
+      const normalizedSelectedMarkets = Array.isArray(newSettings.selectedMarkets)
+        ? newSettings.selectedMarkets
+        : legacyPayload.selectedMarket &&
+            legacyPayload.selectedMarket !== 'ALL' &&
+            legacyPayload.selectedMarket !== 'CUSTOM'
+          ? [legacyPayload.selectedMarket]
+          : state.settings.selectedMarkets;
+      const { selectedMarket: _ignored, ...restNewSettings } = legacyPayload;
+      const merged: Settings = {
+        ...state.settings,
+        ...restNewSettings,
+        strategy: normalizedStrategy,
+        evenOddMode: newSettings.evenOddMode || state.settings.evenOddMode || 'reversal',
+        selectedMarkets: normalizedSelectedMarkets,
+      };
+      if (typeof window !== 'undefined') {
+        if (Array.isArray(merged.selectedMarkets)) {
+          localStorage.setItem('deriv_selected_markets', JSON.stringify(merged.selectedMarkets));
+        }
+        if (Array.isArray(merged.subscribedMarkets)) {
+          localStorage.setItem('deriv_subscribed_markets', JSON.stringify(merged.subscribedMarkets));
+        }
       }
-      return { settings: merged };
+      return {
+        settings: merged,
+        currentStake: state.isRunning ? state.currentStake : (merged.globalStake || 1),
+      };
     }),
   toggleMarketSelection: (symbol) =>
     set((state) => {
@@ -297,12 +345,9 @@ export const useStore = create<AppState>()((set) => ({
       const next = current.includes(symbol)
         ? current.filter((s) => s !== symbol)
         : [...current, symbol];
-      const nextSelectedMarket =
-        next.length === ALL_MARKET_SYMBOLS.length ? 'ALL' : next.length === 1 ? next[0] : 'CUSTOM';
       const updated = {
         ...state.settings,
         selectedMarkets: next,
-        selectedMarket: nextSelectedMarket,
       };
       if (typeof window !== 'undefined') {
         localStorage.setItem('deriv_selected_markets', JSON.stringify(next));
@@ -313,12 +358,9 @@ export const useStore = create<AppState>()((set) => ({
   setSelectedMarkets: (symbols) =>
     set((state) => {
       const next = [...symbols];
-      const nextSelectedMarket =
-        next.length === ALL_MARKET_SYMBOLS.length ? 'ALL' : next.length === 1 ? next[0] : 'CUSTOM';
       const updated = {
         ...state.settings,
         selectedMarkets: next,
-        selectedMarket: nextSelectedMarket,
       };
       if (typeof window !== 'undefined') {
         localStorage.setItem('deriv_selected_markets', JSON.stringify(next));
@@ -326,26 +368,85 @@ export const useStore = create<AppState>()((set) => ({
       }
       return { settings: updated };
     }),
+  toggleSubscribedMarket: (symbol) =>
+    set((state) => {
+      const current = state.settings.subscribedMarkets ?? [...ALL_MARKET_SYMBOLS];
+      const isRemoving = current.includes(symbol);
+      const next = isRemoving
+        ? current.filter((s) => s !== symbol)
+        : [...current, symbol];
+      const updated = {
+        ...state.settings,
+        subscribedMarkets: next,
+      };
+      const updatedMarkets = { ...state.markets };
+      if (isRemoving && updatedMarkets[symbol]) {
+        updatedMarkets[symbol] = {
+          symbol,
+          name: updatedMarkets[symbol].name,
+          currentPrice: 0,
+          currentDigit: 0,
+          streak: 0,
+          evenStreak: 0,
+          oddStreak: 0,
+          streakHistory: []
+        };
+      }
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('deriv_subscribed_markets', JSON.stringify(next));
+        window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: updated }));
+      }
+      return { settings: updated, markets: updatedMarkets };
+    }),
+  setSubscribedMarkets: (symbols) =>
+    set((state) => {
+      const nextSet = new Set(symbols);
+      const next = ALL_MARKET_SYMBOLS.filter((sym) => nextSet.has(sym));
+      const updated = {
+        ...state.settings,
+        subscribedMarkets: next,
+      };
+      const updatedMarkets = { ...state.markets };
+      for (const sym of Object.keys(updatedMarkets)) {
+        if (!nextSet.has(sym)) {
+          updatedMarkets[sym] = {
+            symbol: sym,
+            name: updatedMarkets[sym].name,
+            currentPrice: 0,
+            currentDigit: 0,
+            streak: 0,
+            evenStreak: 0,
+            oddStreak: 0,
+            streakHistory: []
+          };
+        }
+      }
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('deriv_subscribed_markets', JSON.stringify(next));
+        window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: updated }));
+      }
+      return { settings: updated, markets: updatedMarkets };
+    }),
   isRunning: false,
   setIsRunning: (run) => set({ isRunning: run }),
   markets: {
-    'R_10': { symbol: 'R_10', name: 'Volatility 10 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'R_25': { symbol: 'R_25', name: 'Volatility 25 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'R_50': { symbol: 'R_50', name: 'Volatility 50 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'R_75': { symbol: 'R_75', name: 'Volatility 75 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'R_100': { symbol: 'R_100', name: 'Volatility 100 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    '1HZ10V': { symbol: '1HZ10V', name: 'Volatility 10 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    '1HZ25V': { symbol: '1HZ25V', name: 'Volatility 25 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    '1HZ50V': { symbol: '1HZ50V', name: 'Volatility 50 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    '1HZ75V': { symbol: '1HZ75V', name: 'Volatility 75 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    '1HZ100V': { symbol: '1HZ100V', name: 'Volatility 100 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'JD10': { symbol: 'JD10', name: 'Jump 10 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'JD25': { symbol: 'JD25', name: 'Jump 25 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'JD50': { symbol: 'JD50', name: 'Jump 50 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'JD75': { symbol: 'JD75', name: 'Jump 75 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'JD100': { symbol: 'JD100', name: 'Jump 100 Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'RDBEAR': { symbol: 'RDBEAR', name: 'Bear Market Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] },
-    'RDBULL': { symbol: 'RDBULL', name: 'Bull Market Index', currentPrice: 0, currentDigit: 0, streak: 0, streakHistory: [] }
+    'R_10': { symbol: 'R_10', name: 'Volatility 10 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'R_25': { symbol: 'R_25', name: 'Volatility 25 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'R_50': { symbol: 'R_50', name: 'Volatility 50 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'R_75': { symbol: 'R_75', name: 'Volatility 75 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'R_100': { symbol: 'R_100', name: 'Volatility 100 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    '1HZ10V': { symbol: '1HZ10V', name: 'Volatility 10 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    '1HZ25V': { symbol: '1HZ25V', name: 'Volatility 25 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    '1HZ50V': { symbol: '1HZ50V', name: 'Volatility 50 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    '1HZ75V': { symbol: '1HZ75V', name: 'Volatility 75 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    '1HZ100V': { symbol: '1HZ100V', name: 'Volatility 100 (1s) Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'JD10': { symbol: 'JD10', name: 'Jump 10 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'JD25': { symbol: 'JD25', name: 'Jump 25 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'JD50': { symbol: 'JD50', name: 'Jump 50 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'JD75': { symbol: 'JD75', name: 'Jump 75 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'JD100': { symbol: 'JD100', name: 'Jump 100 Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'RDBEAR': { symbol: 'RDBEAR', name: 'Bear Market Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] },
+    'RDBULL': { symbol: 'RDBULL', name: 'Bull Market Index', currentPrice: 0, currentDigit: 0, streak: 0, evenStreak: 0, oddStreak: 0, streakHistory: [] }
   },
   updateMarket: (symbol, data) =>
     set((state) => ({
@@ -475,5 +576,7 @@ export const useStore = create<AppState>()((set) => ({
   lastLostSymbol: null,
   setLastLostSymbol: (symbol) => set({ lastLostSymbol: symbol }),
   isWaitingForRecovery: false,
-  setIsWaitingForRecovery: (isWaiting) => set({ isWaitingForRecovery: isWaiting })
+  setIsWaitingForRecovery: (isWaiting) => set({ isWaitingForRecovery: isWaiting }),
+  currentStake: 1,
+  setCurrentStake: (stake) => set({ currentStake: stake }),
 }));

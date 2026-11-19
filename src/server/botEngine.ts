@@ -8,11 +8,21 @@ let sessionPnL = 0;
 let lastLostSymbol: string | null = null;
 let cumulativeLoss = 0;
 
+function stripSecretsFromSettings(settings: any) {
+  if (!settings || typeof settings !== 'object') return settings;
+  const { apiToken: _removedToken, ...safeSettings } = settings;
+  return safeSettings;
+}
+
 async function saveSettings(settings: any) {
   try {
     const supabase = getSupabase();
     if (!supabase) return;
-    await supabase.from('bot_data').upsert({ id: 'settings', data: settings, updated_at: new Date().toISOString() });
+    await supabase.from('bot_data').upsert({
+      id: 'settings',
+      data: stripSecretsFromSettings(settings),
+      updated_at: new Date().toISOString()
+    });
   } catch (err) {
     console.error('Error saving settings:', err);
   }
@@ -70,7 +80,7 @@ export async function initBot() {
     
     const { data: settingsRow } = await supabase.from('bot_data').select('data').eq('id', 'settings').single();
     if (settingsRow && settingsRow.data) {
-      currentSettings = settingsRow.data;
+      currentSettings = stripSecretsFromSettings(settingsRow.data);
     }
     
     const { data: stateRow } = await supabase.from('bot_data').select('data').eq('id', 'state').single();
@@ -153,7 +163,7 @@ export function startBotEngine(io: Server) {
       }
 
       if (data.type === 'UPDATE_SETTINGS') {
-        currentSettings = data.settings;
+        currentSettings = stripSecretsFromSettings(data.settings);
         saveSettings(currentSettings);
         socket.broadcast.emit('bot_sync', { currentSettings });
       }
@@ -163,7 +173,7 @@ export function startBotEngine(io: Server) {
       }
 
       if (data.type === 'START') {
-        currentSettings = data.settings;
+        currentSettings = stripSecretsFromSettings(data.settings);
         saveSettings(currentSettings);
         isRunning = true;
         saveState();
