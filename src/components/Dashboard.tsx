@@ -51,6 +51,24 @@ export function Dashboard() {
     });
     workerRef.current = worker;
 
+    // Fetch runtime server config (e.g. DERIV_APP_ID from environment variable)
+    fetch('/api/config')
+      .then(res => res.json())
+      .then(cfg => {
+        if (cfg?.appId && cfg.appId !== '1089') {
+          const currentAppId = useStore.getState().settings.appId;
+          if (currentAppId === '1089' || !currentAppId) {
+            useStore.getState().setSettings({ appId: cfg.appId });
+            useStore.getState().setAuth({ appId: cfg.appId });
+            workerRef.current?.postMessage({
+              type: 'UPDATE_SETTINGS',
+              settings: { ...useStore.getState().settings, appId: cfg.appId }
+            });
+          }
+        }
+      })
+      .catch(() => {});
+
     // Pass initial settings to worker
     worker.postMessage({
       type: 'INIT',

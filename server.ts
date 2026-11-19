@@ -35,6 +35,13 @@ async function startServer() {
     res.send("Bot is running!");
   });
 
+  // Client configuration (Runtime App ID from environment variable)
+  app.get("/api/config", (req, res) => {
+    res.json({
+      appId: process.env.DERIV_APP_ID || process.env.VITE_DERIV_APP_ID || "1089"
+    });
+  });
+
   // Server-side Gemini AI backtest risk & market selection endpoint
   app.post("/api/backtest/ai-analyze", async (req, res) => {
     const { config, results } = req.body || {};

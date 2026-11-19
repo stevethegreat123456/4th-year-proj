@@ -477,6 +477,12 @@ export function DerivAuth() {
     return () => window.removeEventListener('open_deriv_login_modal', handleOpenLogin);
   }, []);
 
+  useEffect(() => {
+    if (auth.appId && auth.appId !== customAppId) {
+      setCustomAppId(auth.appId);
+    }
+  }, [auth.appId, customAppId]);
+
   const handlePKCELogin = async () => {
     const appIdToUse = customAppId.trim() || DEFAULT_APP_ID;
     setAuth({ appId: appIdToUse });

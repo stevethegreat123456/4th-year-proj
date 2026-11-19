@@ -6,7 +6,7 @@ export interface DerivAccount {
   balance?: number;
 }
 
-export const DEFAULT_APP_ID = '1089';
+export const DEFAULT_APP_ID = (import.meta as any).env?.VITE_DERIV_APP_ID || '1089';
 
 /**
  * Parses query parameters returned by Deriv OAuth 2.0.
