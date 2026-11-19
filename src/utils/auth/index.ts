@@ -31,6 +31,7 @@ export {
   OPTIONS_API_BASE_URL,
   fetchAccounts,
   getWebSocketOTP,
+  resetDemoBalance,
   DerivWSAccountsService,
   logout,
 } from './accounts';

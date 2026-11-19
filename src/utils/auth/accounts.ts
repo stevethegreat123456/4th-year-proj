@@ -102,6 +102,45 @@ export async function getWebSocketOTP(
   return payload.data.url;
 }
 
+export async function resetDemoBalance(
+  accessToken: string,
+  accountId: string,
+  appId?: string
+): Promise<number> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+  };
+  if (appId && /^\d+$/.test(appId)) {
+    headers['Deriv-App-ID'] = appId;
+  }
+
+  const response = await fetch(
+    `${OPTIONS_API_BASE_URL}/accounts/${encodeURIComponent(accountId)}/reset-demo-balance`,
+    {
+      method: 'POST',
+      headers,
+    }
+  );
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const errMsg =
+      payload?.errors?.[0]?.message ||
+      payload?.error?.message ||
+      payload?.message ||
+      `Failed to reset demo balance (${response.status})`;
+    throw new Error(errMsg);
+  }
+
+  if (payload?.data?.balance !== undefined) {
+    return Number(payload.data.balance);
+  }
+
+  const accounts = await fetchAccounts(accessToken, appId);
+  const updated = accounts.find((a) => a.account === accountId);
+  return updated?.balance ?? 10000;
+}
+
 export const DerivWSAccountsService = {
   async fetchAccountsList(accessToken: string, appId?: string): Promise<DerivAccount[]> {
     return fetchAccounts(accessToken, appId);
@@ -109,6 +148,10 @@ export const DerivWSAccountsService = {
 
   storeAccounts(accounts: DerivAccount[]): void {
     storeDerivAccounts(accounts);
+  },
+
+  async resetDemoBalance(accessToken: string, accountId: string, appId?: string): Promise<number> {
+    return resetDemoBalance(accessToken, accountId, appId);
   },
 
   async getAuthenticatedWebSocketURL(

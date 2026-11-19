@@ -125,7 +125,25 @@ export function Dashboard() {
       } else if (msg.type === 'STATUS') {
         setConnectionStatus(msg.status);
       } else if (msg.type === 'BALANCE') {
-        setBalance(msg.balance);
+        const nextBal = Number(msg.balance);
+        setBalance(nextBal);
+        const state = useStore.getState();
+        if (state.auth.activeAccount) {
+          const activeId = state.auth.activeAccount.account;
+          useStore.getState().setAuth({
+            activeAccount: { ...state.auth.activeAccount, balance: nextBal },
+            accounts: state.auth.accounts.map((a) =>
+              a.account === activeId ? { ...a, balance: nextBal } : a
+            ),
+          });
+        }
+      } else if (msg.type === 'TOPUP_SUCCESS') {
+        const balText =
+          msg.balance !== undefined ? `$${Number(msg.balance).toFixed(2)}` : 'updated';
+        setAlertBanner({
+          type: 'info',
+          message: `Demo account balance reset (${balText}).`,
+        });
       } else if (msg.type === 'AUTH_SUCCESS') {
         useStore.getState().updateFromDerivAuth(msg.account);
         setAlertBanner(null);

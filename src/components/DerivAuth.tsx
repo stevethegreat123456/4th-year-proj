@@ -1,10 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useStore, DerivAccount } from '../store/useStore';
 import {
-  parseDerivOAuthParams,
   launchDerivPKCELogin,
   launchDerivPKCESignUp,
-  launchDerivLogin,
   handleOAuthCallback,
   cleanupUrl,
   DerivWSAccountsService,
@@ -43,18 +41,6 @@ export function DerivAuth() {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<'oauth' | 'pat'>('oauth');
 
-  const [customAppId, setCustomAppId] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return (
-        localStorage.getItem('oauth_client_id') ||
-        localStorage.getItem('deriv_app_id') ||
-        auth.appId ||
-        DEFAULT_APP_ID
-      );
-    }
-    return auth.appId || DEFAULT_APP_ID;
-  });
-
   const [patInput, setPatInput] = useState(() => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('deriv_api_token') || '';
@@ -78,13 +64,13 @@ export function DerivAuth() {
   const resolveRuntimeClientId = async (): Promise<string> => {
     const stored = getStoredOAuthClientId();
     if (stored && stored !== '1089') return stored;
-    if (customAppId && customAppId !== '1089') return customAppId;
+    if (auth.appId && auth.appId !== '1089') return auth.appId;
     try {
       const res = await fetch('/api/config');
       const cfg = await res.json();
       if (cfg?.appId) return String(cfg.appId).trim();
     } catch {}
-    return customAppId.trim() || DEFAULT_APP_ID;
+    return auth.appId || DEFAULT_APP_ID;
   };
 
   // Validate and log in using Legacy Deriv Personal Access Token (PAT)
@@ -349,61 +335,7 @@ export function DerivAuth() {
     }
   };
 
-  // Legacy WebSocket authorize helper (for ?acct1=...&token1=... callbacks)
-  const fetchLegacyAccountDetails = (token: string, appId: string = '1089') => {
-    try {
-      const wsAppId = /^\d+$/.test(appId) ? appId : '1089';
-      const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${wsAppId}`);
-      ws.onopen = () => ws.send(JSON.stringify({ authorize: token }));
-      ws.onmessage = (msg) => {
-        try {
-          const data = JSON.parse(msg.data);
-          if (data.msg_type === 'authorize' && data.authorize) {
-            const authData = data.authorize;
-            const accountList = authData.account_list || [];
-            const existingAccounts = useStore.getState().auth.accounts || [];
-            const accounts: DerivAccount[] = accountList.map((acc: any) => {
-              const existing = existingAccounts.find(ea => ea.account === acc.loginid);
-              const isCurrent = acc.loginid === authData.loginid;
-              return {
-                account: acc.loginid,
-                account_id: acc.loginid,
-                token: isCurrent ? token : (existing?.token || ''),
-                currency: acc.currency || 'USD',
-                isVirtual: Boolean(acc.is_virtual || String(acc.loginid).startsWith('VR') || String(acc.loginid).startsWith('D')),
-                balance: isCurrent ? Number(authData.balance) : existing?.balance
-              };
-            });
-
-            const activeAccount: DerivAccount = {
-              account: authData.loginid,
-              account_id: authData.loginid,
-              token,
-              currency: authData.currency || 'USD',
-              isVirtual: Boolean(authData.is_virtual || String(authData.loginid).startsWith('VR') || String(authData.loginid).startsWith('D')),
-              balance: Number(authData.balance) || 0
-            };
-
-            setAuth({
-              isLoggedIn: true,
-              userName: authData.fullname,
-              userEmail: authData.email,
-              accounts: accounts.length > 0 ? accounts : [activeAccount],
-              activeAccount
-            });
-
-            if (authData.balance !== undefined) {
-              useStore.getState().setBalance(Number(authData.balance));
-            }
-            ws.close();
-          }
-        } catch {}
-      };
-      ws.onerror = () => ws.close();
-    } catch {}
-  };
-
-  // OAuth Callback & Session Hydration (following me.txt flow)
+  // OAuth Callback & Session Hydration (PKCE flow)
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -474,34 +406,7 @@ export function DerivAuth() {
       return;
     }
 
-    // 2. Handle Legacy Deriv OAuth Callback (?acct1=...&token1=...)
-    const queryAccounts = parseDerivOAuthParams(window.location.search);
-    if (queryAccounts.length > 0) {
-      const defaultActive = queryAccounts.find(a => a.isVirtual) || queryAccounts[0];
-      setAuth({
-        isLoggedIn: true,
-        accounts: queryAccounts,
-        activeAccount: defaultActive
-      });
-
-      const nextSettings = {
-        ...useStore.getState().settings,
-        apiToken: defaultActive.token,
-        authMethod: 'pat' as const,
-        activeAccountId: defaultActive.account,
-        accountCurrency: defaultActive.currency || 'USD'
-      };
-      setSettings(nextSettings);
-      fetchLegacyAccountDetails(defaultActive.token, customAppId || '1089');
-      cleanupUrl(window.location.origin);
-
-      window.dispatchEvent(new CustomEvent('bot_settings_changed', {
-        detail: nextSettings
-      }));
-      return;
-    }
-
-    // 3. Auto-refresh expired OAuth session on load if refresh_token exists
+    // 2. Auto-refresh expired OAuth session on load if refresh_token exists
     const validAuthInfo = getAuthInfo(false);
     const anyAuthInfo = getAuthInfo(true);
     if (!validAuthInfo && anyAuthInfo?.refresh_token) {
@@ -538,37 +443,21 @@ export function DerivAuth() {
     return () => window.removeEventListener('open_deriv_login_modal', handleOpenLogin);
   }, []);
 
-  useEffect(() => {
-    if (auth.appId && auth.appId !== customAppId) {
-      setCustomAppId(auth.appId);
-    }
-  }, [auth.appId, customAppId]);
-
-  const handleOAuthLogin = async (forcedAppId?: string) => {
-    const appIdToUse = (forcedAppId || customAppId).trim() || DEFAULT_APP_ID;
-    setAuth({ appId: appIdToUse });
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('deriv_app_id', appIdToUse);
-    }
+  const handleOAuthLogin = async () => {
     try {
-      if (appIdToUse === '1089' || (/^\d+$/.test(appIdToUse) && appIdToUse.length <= 5)) {
-        launchDerivLogin(appIdToUse);
-        return;
-      }
-      await launchDerivPKCELogin(appIdToUse, window.location.origin);
+      const clientId = await resolveRuntimeClientId();
+      setAuth({ appId: clientId });
+      await launchDerivPKCELogin(clientId, window.location.origin);
     } catch (err: any) {
       setAuthError(err.message || 'Failed to launch OAuth');
     }
   };
 
   const handleOAuthSignUp = async () => {
-    const appIdToUse = customAppId.trim() || DEFAULT_APP_ID;
-    setAuth({ appId: appIdToUse });
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('deriv_app_id', appIdToUse);
-    }
     try {
-      await launchDerivPKCESignUp(appIdToUse, window.location.origin);
+      const clientId = await resolveRuntimeClientId();
+      setAuth({ appId: clientId });
+      await launchDerivPKCESignUp(clientId, window.location.origin);
     } catch (err: any) {
       setAuthError(err.message || 'Failed to launch Sign Up');
     }
@@ -734,12 +623,13 @@ export function DerivAuth() {
                       type="button"
                       onClick={() => {
                         window.dispatchEvent(new CustomEvent('deriv_topup_virtual'));
+                        setIsDropdownOpen(false);
                       }}
-                      title="Top-up Virtual Demo Account"
+                      title="Reset / Top-up Virtual Demo Balance"
                       className="text-[10px] text-[#ffb000] hover:text-[#ffd060] flex items-center gap-1 font-semibold cursor-pointer"
                     >
                       <RefreshCw size={10} />
-                      Top Up
+                      Reset Demo
                     </button>
                   )}
                   <button
@@ -856,28 +746,15 @@ export function DerivAuth() {
                   <ExternalLink size={12} className="opacity-80" />
                 </button>
 
-                {!/^\d+$/.test(customAppId) && (
-                  <button
-                    type="button"
-                    onClick={handleOAuthSignUp}
-                    disabled={isExchangingCode}
-                    className="w-full flex items-center justify-center gap-1.5 bg-[#18181b] hover:bg-[#27272a] border border-[#27272a] text-[#e4e4e7] py-2 px-3 rounded-lg font-semibold text-[11px] transition-all cursor-pointer"
-                  >
-                    <UserPlus size={13} />
-                    <span>Create Deriv Account</span>
-                  </button>
-                )}
-
-                <div className="flex items-center justify-between gap-2 pt-0.5">
-                  <span className="text-[10px] text-[#71717a] uppercase">Client / App ID</span>
-                  <input
-                    type="text"
-                    value={customAppId}
-                    onChange={(e) => setCustomAppId(e.target.value.trim())}
-                    placeholder="1089"
-                    className="w-40 bg-black/50 border border-[#27272a] text-[#e4e4e7] px-2 py-1 rounded text-[11px] text-right outline-none focus:border-[#ff444f]"
-                  />
-                </div>
+                <button
+                  type="button"
+                  onClick={handleOAuthSignUp}
+                  disabled={isExchangingCode}
+                  className="w-full flex items-center justify-center gap-1.5 bg-[#18181b] hover:bg-[#27272a] border border-[#27272a] text-[#e4e4e7] py-2 px-3 rounded-lg font-semibold text-[11px] transition-all cursor-pointer"
+                >
+                  <UserPlus size={13} />
+                  <span>Create Deriv Account</span>
+                </button>
               </div>
             )}
 
@@ -899,7 +776,7 @@ export function DerivAuth() {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault();
-                        validateAndLoginWithPAT(patInput, customAppId);
+                        validateAndLoginWithPAT(patInput, auth.appId || '1089');
                       }
                     }}
                     placeholder="Paste Deriv API Token"
@@ -928,7 +805,7 @@ export function DerivAuth() {
 
                 <button
                   type="button"
-                  onClick={() => validateAndLoginWithPAT(patInput, customAppId)}
+                  onClick={() => validateAndLoginWithPAT(patInput, auth.appId || '1089')}
                   disabled={!patInput.trim() || isValidatingPAT}
                   className="w-full flex items-center justify-center gap-1.5 bg-[#00ff9c] hover:bg-[#00ff9c]/90 disabled:opacity-50 text-black py-2 px-3 rounded-lg font-bold text-xs transition-all cursor-pointer"
                 >

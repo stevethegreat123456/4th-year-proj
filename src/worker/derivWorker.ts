@@ -977,7 +977,70 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
   }
 
   if (data.type === 'TOPUP') {
-    if (tradeWs && tradeWs.readyState === WebSocket.OPEN) {
+    const useRestReset = isOtpSocket || (currentSettings?.authMethod === 'oauth' && Boolean(currentSettings?.activeAccountId));
+    if (useRestReset && currentSettings?.apiToken && currentSettings?.activeAccountId) {
+      const accountId = currentSettings.activeAccountId;
+      const token = currentSettings.apiToken;
+      (async () => {
+        try {
+          const resetRes = await fetch(
+            `${OPTIONS_API_BASE}/accounts/${encodeURIComponent(accountId)}/reset-demo-balance`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            }
+          );
+
+          if (resetRes.status === 401) {
+            emit({ type: 'TOKEN_EXPIRED' });
+            return;
+          }
+
+          const resetPayload = await resetRes.json().catch(() => ({}));
+          if (!resetRes.ok) {
+            const errMsg =
+              resetPayload?.errors?.[0]?.message ||
+              resetPayload?.error?.message ||
+              resetPayload?.message ||
+              `Failed to reset demo balance (${resetRes.status})`;
+            emit({ type: 'ERROR', message: errMsg });
+            return;
+          }
+
+          let updatedBalance: number | null =
+            resetPayload?.data?.balance !== undefined ? Number(resetPayload.data.balance) : null;
+
+          if (updatedBalance === null || Number.isNaN(updatedBalance)) {
+            const accRes = await fetch(`${OPTIONS_API_BASE}/accounts`, {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const accPayload = await accRes.json().catch(() => ({}));
+            const list = Array.isArray(accPayload?.data) ? accPayload.data : [];
+            const match = list.find((a: any) => a.account_id === accountId);
+            if (match?.balance !== undefined) {
+              updatedBalance = Number(match.balance);
+            }
+          }
+
+          if (updatedBalance !== null && !Number.isNaN(updatedBalance)) {
+            currentBalance = updatedBalance;
+            emit({ type: 'BALANCE', balance: updatedBalance });
+            emit({ type: 'TOPUP_SUCCESS', balance: updatedBalance, accountId });
+          } else {
+            emit({ type: 'TOPUP_SUCCESS', accountId });
+          }
+
+          if (tradeWs && tradeWs.readyState === WebSocket.OPEN) {
+            tradeWs.send('{"balance":1}');
+          }
+        } catch (err: any) {
+          emit({ type: 'ERROR', message: err?.message || 'Failed to reset demo balance' });
+        }
+      })();
+    } else if (tradeWs && tradeWs.readyState === WebSocket.OPEN) {
       tradeWs.send('{"topup_virtual":1}');
     }
   }
