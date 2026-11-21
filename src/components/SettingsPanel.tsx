@@ -16,11 +16,15 @@ export function SettingsPanel() {
 
   const [selectedStrategy, setSelectedStrategy] = useState<StrategyType>(() => normalizeStrategy(settings.strategy));
   const [evenOddMode, setEvenOddMode] = useState<EvenOddMode>(settings.evenOddMode || 'reversal');
+  const [autoRotateTop3Over1, setAutoRotateTop3Over1] = useState<boolean>(
+    Boolean(settings.autoRotateTop3Over1)
+  );
 
   useEffect(() => {
     if (isOpen) {
       setSelectedStrategy(normalizeStrategy(settings.strategy));
       setEvenOddMode(settings.evenOddMode || 'reversal');
+      setAutoRotateTop3Over1(Boolean(settings.autoRotateTop3Over1));
     }
   }, [isOpen, settings]);
 
@@ -43,6 +47,7 @@ export function SettingsPanel() {
       stopTime: (fd.get('stopTime') as string) || '17:00',
       strategy: selectedStrategy,
       evenOddMode: evenOddMode,
+      autoRotateTop3Over1: selectedStrategy === 'DIGIT_OVER' ? autoRotateTop3Over1 : false,
       selectedMarkets: settings.selectedMarkets,
       subscribedMarkets: settings.subscribedMarkets
     };
@@ -175,6 +180,26 @@ export function SettingsPanel() {
                         ? 'Triggers when consecutive Even or Odd digits reach this threshold.'
                         : 'Triggers Over 1 contract when consecutive digits (0 or 1) reaches this threshold.'}
                     </span>
+
+                    {selectedStrategy === 'DIGIT_OVER' && (
+                      <div className="pt-2.5 mt-1 border-t border-[#27272a]/70 flex items-start gap-2.5">
+                        <input
+                          type="checkbox"
+                          id="autoRotateTop3Over1"
+                          checked={autoRotateTop3Over1}
+                          onChange={(e) => setAutoRotateTop3Over1(e.target.checked)}
+                          className="accent-[#00ff9c] mt-0.5 cursor-pointer"
+                        />
+                        <label htmlFor="autoRotateTop3Over1" className="cursor-pointer space-y-0.5">
+                          <span className="text-[11px] font-bold text-[#e4e4e7] block">
+                            Continuous 5K Auto-Monitor (Top 3 Markets)
+                          </span>
+                          <span className="text-[10px] text-[#71717a] block">
+                            Continuously evaluates the rolling 5,000-tick backtest across all 17 indices and rotates trading to the Top 3 lowest-drawdown markets between trades.
+                          </span>
+                        </label>
+                      </div>
+                    )}
                   </div>
                 )}
 

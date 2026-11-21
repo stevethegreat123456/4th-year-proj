@@ -3,7 +3,7 @@ import {
   EvenOddMode,
   SYNTHETIC_MARKET_CATALOG,
   StrategyType,
-} from '../store/useStore';
+} from './marketCatalog';
 import { evaluateDCirclesSignal } from './dCirclesStrategy';
 
 const PUBLIC_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';

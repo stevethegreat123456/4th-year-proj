@@ -6,6 +6,8 @@ import { MarketMultiSelect } from './MarketMultiSelect';
 export function MarketGrid() {
   const markets = useStore((state) => state.markets);
   const settings = useStore((state) => state.settings);
+  const autoRotateInfo = useStore((state) => state.autoRotateInfo);
+  const setSettings = useStore((state) => state.setSettings);
   const toggleMarketSelection = useStore((state) => state.toggleMarketSelection);
   const toggleSubscribedMarket = useStore((state) => state.toggleSubscribedMarket);
   const setSelectedMarkets = useStore((state) => state.setSelectedMarkets);
@@ -16,8 +18,15 @@ export function MarketGrid() {
 
   const isEvenOdd = settings.strategy === 'EVEN_ODD';
   const isDCirclesEvenOdd = settings.strategy === 'DCIRCLES_EVEN_ODD';
+  const isAutoTop3Over1 = settings.strategy === 'DIGIT_OVER' && Boolean(settings.autoRotateTop3Over1);
   const evenOddMode: EvenOddMode = settings.evenOddMode || 'reversal';
   const connectionStatus = useStore((state) => state.connectionStatus);
+
+  const handlePauseAutoTop3 = () => {
+    const updated = { ...settings, autoRotateTop3Over1: false };
+    setSettings({ autoRotateTop3Over1: false });
+    window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: updated }));
+  };
 
   const subscribedMarkets: string[] = Array.isArray(settings.subscribedMarkets)
     ? settings.subscribedMarkets
@@ -71,7 +80,10 @@ export function MarketGrid() {
           </span>
           <button
             type="button"
-            onClick={() => setSelectedMarkets([...ALL_MARKET_SYMBOLS])}
+            onClick={() => {
+              if (isAutoTop3Over1) setSettings({ autoRotateTop3Over1: false });
+              setSelectedMarkets([...ALL_MARKET_SYMBOLS]);
+            }}
             disabled={allSelected}
             className={`px-2 py-1 rounded border text-[10px] uppercase font-semibold transition-colors ${
               allSelected
@@ -83,7 +95,10 @@ export function MarketGrid() {
           </button>
           <button
             type="button"
-            onClick={() => setSelectedMarkets([])}
+            onClick={() => {
+              if (isAutoTop3Over1) setSettings({ autoRotateTop3Over1: false });
+              setSelectedMarkets([]);
+            }}
             disabled={selectedMarkets.length === 0}
             className={`px-2 py-1 rounded border text-[10px] uppercase font-semibold transition-colors ${
               selectedMarkets.length === 0
@@ -108,6 +123,37 @@ export function MarketGrid() {
           </button>
         </div>
       </div>
+
+      {isAutoTop3Over1 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 bg-[#111114] border border-[#00ff9c]/40 px-4 py-2 rounded-lg text-[11px] font-mono">
+          <div className="flex flex-wrap items-center gap-2 text-[#e4e4e7] tabular-nums">
+            <span className="w-2 h-2 rounded-full bg-[#00ff9c] animate-pulse shrink-0" />
+            {autoRotateInfo.seededCount < autoRotateInfo.totalCount ? (
+              <span>
+                <strong className="text-[#00ff9c]">Auto Top 3</strong> · Seeding{' '}
+                {autoRotateInfo.seededCount}/{autoRotateInfo.totalCount} markets (5K ticks)
+              </span>
+            ) : (
+              <span>
+                <strong className="text-[#00ff9c]">Auto Top 3 Active:</strong>{' '}
+                {(autoRotateInfo.top3.length > 0 ? autoRotateInfo.top3 : selectedMarkets).join(', ') || 'Evaluating'}
+                {autoRotateInfo.lastEvaluatedAt && (
+                  <span className="text-[#71717a] ml-2">
+                    · Checked {new Date(autoRotateInfo.lastEvaluatedAt).toLocaleTimeString()}
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handlePauseAutoTop3}
+            className="px-2.5 py-0.5 rounded border border-[#ff4b4b]/40 bg-[#ff4b4b]/10 text-[#ff4b4b] hover:bg-[#ff4b4b]/20 font-bold uppercase text-[10px] shrink-0 cursor-pointer"
+          >
+            Pause Auto
+          </button>
+        </div>
+      )}
 
       {subscribedMarketList.length > 0 && activeTradingCount === 0 && (
         <div className="flex items-center justify-between gap-2 bg-[#ffb000]/10 border border-[#ffb000]/30 text-[#ffb000] px-4 py-2 rounded-lg text-[11px] font-mono">
@@ -185,7 +231,10 @@ export function MarketGrid() {
               lastLostSymbol={lastLostSymbol}
               isWaitingForRecovery={isWaitingForRecovery}
               isSelected={selectedMarkets.includes(market.symbol)}
-              onToggleSelect={() => toggleMarketSelection(market.symbol)}
+              onToggleSelect={() => {
+                if (isAutoTop3Over1) setSettings({ autoRotateTop3Over1: false });
+                toggleMarketSelection(market.symbol);
+              }}
               onRemove={() => toggleSubscribedMarket(market.symbol)}
             />
           ))}

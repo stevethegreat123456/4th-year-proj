@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { useStore } from '../store/useStore';
+import { ALL_MARKET_SYMBOLS, useStore } from '../store/useStore';
 import { SettingsPanel } from './SettingsPanel';
 import { HistoryPanel } from './HistoryPanel';
 import { MarketGrid } from './MarketGrid';
@@ -123,6 +123,46 @@ export function Dashboard() {
         }
       } else if (msg.type === 'DIGIT_STAT') {
         incrementDigit(msg.digit);
+      } else if (msg.type === 'AUTO_MONITOR_STATUS') {
+        const state = useStore.getState();
+        state.setAutoRotateInfo({
+          seededCount: msg.seededCount ?? state.autoRotateInfo.seededCount,
+          totalCount: msg.totalCount ?? state.autoRotateInfo.totalCount,
+          ...(Array.isArray(msg.top3) ? { top3: msg.top3 } : {}),
+          ...(Array.isArray(msg.topMarkets) ? { topMarkets: msg.topMarkets } : {}),
+          ...(msg.evaluatedAt ? { lastEvaluatedAt: msg.evaluatedAt } : {}),
+        });
+      } else if (msg.type === 'AUTO_MARKETS_UPDATED') {
+        const state = useStore.getState();
+        const nextTop3 = Array.isArray(msg.top3) ? msg.top3 : [];
+        state.setAutoRotateInfo({
+          seededCount: msg.seededCount ?? state.autoRotateInfo.seededCount,
+          totalCount: msg.totalCount ?? state.autoRotateInfo.totalCount,
+          top3: nextTop3,
+          topMarkets: Array.isArray(msg.topMarkets) ? msg.topMarkets : state.autoRotateInfo.topMarkets,
+          lastEvaluatedAt: msg.rotatedAt ?? Date.now(),
+          lastRotatedAt: msg.rotatedAt ?? Date.now(),
+        });
+        if (nextTop3.length > 0) {
+          const currentSub = Array.isArray(state.settings.subscribedMarkets)
+            ? state.settings.subscribedMarkets
+            : [...ALL_MARKET_SYMBOLS];
+          const mergedSub = ALL_MARKET_SYMBOLS.filter(
+            (s) => currentSub.includes(s) || nextTop3.includes(s)
+          );
+          state.setSettings({
+            selectedMarkets: nextTop3,
+            subscribedMarkets: mergedSub,
+          });
+          socketRef.current?.emit('worker_command', {
+            type: 'UPDATE_SETTINGS',
+            settings: sanitizeSettingsForServer(useStore.getState().settings),
+          });
+          setAlertBanner({
+            type: 'info',
+            message: `Over 1 Auto-Monitor switched Top 3 markets: ${nextTop3.join(', ')}`,
+          });
+        }
       } else if (msg.type === 'STATUS') {
         setConnectionStatus(msg.status);
       } else if (msg.type === 'BALANCE') {

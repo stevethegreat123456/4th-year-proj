@@ -1,4 +1,6 @@
 import { evaluateDCirclesSignal } from '../utils/dCirclesStrategy';
+import { SYNTHETIC_MARKET_CATALOG } from '../utils/marketCatalog';
+import { MarketBacktestResult, MarketTickSeries, runBacktestSuite } from '../utils/backtestEngine';
 
 export type WorkerCommand = 
   | { type: 'INIT', settings: any }
@@ -67,6 +69,10 @@ let isSubscribedToMarkets = false;
 const activeTickSymbols = new Set<string>();
 let tickSubIds: Record<string, string> = {};
 let historyReqIdToSymbol: Record<number, string> = {};
+let pendingAutoTop3: { top3: string[]; topMarkets: any[] } | null = null;
+let autoRotateInterval: any = null;
+let lastSeededReadyEval = false;
+const MAX_SEED_CONCURRENCY = 4;
 
 let tradeWs: WebSocket | null = null;
 let tradePingInterval: any = null;
@@ -169,6 +175,20 @@ function getSubscribedMarkets(): string[] {
   return [...markets];
 }
 
+function isAutoRotateOver1Enabled(): boolean {
+  return (
+    (!currentSettings?.strategy || currentSettings.strategy === 'DIGIT_OVER') &&
+    Boolean(currentSettings?.autoRotateTop3Over1)
+  );
+}
+
+function getStreamTargetMarkets(): string[] {
+  if (isAutoRotateOver1Enabled()) {
+    return [...markets];
+  }
+  return getSubscribedMarkets();
+}
+
 function resetMarketState(symbol: string) {
   const st = marketStates[symbol];
   if (!st) return;
@@ -208,17 +228,171 @@ function pushDigitTo5kWindow(state: MarketState, digit: number) {
   }
 }
 
+function getMarketMeta(symbol: string) {
+  const found = SYNTHETIC_MARKET_CATALOG.find((m) => m.symbol === symbol);
+  return {
+    name: found?.name || symbol,
+    shortName: found?.shortName || symbol,
+  };
+}
+
+function toCompactTopMarkets(ranked: MarketBacktestResult[]) {
+  return ranked.slice(0, 5).map((r) => ({
+    symbol: r.symbol,
+    shortName: r.shortName,
+    maxDrawdown: r.maxDrawdown,
+    netPnL: r.netPnL,
+    riskScore: r.riskScore,
+    riskTier: r.riskTier,
+    tickCount: r.tickCount,
+  }));
+}
+
+function applyAutoTop3Selection(top3: string[], topMarkets: any[]) {
+  if (!currentSettings || top3.length === 0) return;
+  const currentSubscribed = Array.isArray(currentSettings.subscribedMarkets)
+    ? currentSettings.subscribedMarkets
+    : [...markets];
+  const mergedSubscribed = markets.filter(
+    (s) => currentSubscribed.includes(s) || top3.includes(s)
+  );
+
+  currentSettings = {
+    ...currentSettings,
+    selectedMarkets: top3,
+    subscribedMarkets: mergedSubscribed,
+  };
+  pendingAutoTop3 = null;
+
+  const seededCount = markets.filter((m) => marketStates[m].seeded5k).length;
+  emit({
+    type: 'AUTO_MARKETS_UPDATED',
+    top3,
+    topMarkets,
+    seededCount,
+    totalCount: markets.length,
+    rotatedAt: Date.now(),
+  });
+}
+
+function evaluateAutoTop3Over1(forceNotify = false) {
+  if (!isAutoRotateOver1Enabled()) return;
+
+  const seriesList: MarketTickSeries[] = [];
+  let seededCount = 0;
+
+  for (const sym of markets) {
+    const st = marketStates[sym];
+    if (st.seeded5k) seededCount += 1;
+    if (!st.seeded5k || st.ring5kLen < 100) continue;
+
+    const len = st.ring5kLen;
+    const digits = new Array<number>(len);
+    const start = len === DCIRCLES_WINDOW_SIZE ? st.ring5kWriteIdx : 0;
+    for (let i = 0; i < len; i++) {
+      digits[i] = st.ring5k[(start + i) % DCIRCLES_WINDOW_SIZE];
+    }
+
+    const meta = getMarketMeta(sym);
+    seriesList.push({
+      symbol: sym,
+      name: meta.name,
+      shortName: meta.shortName,
+      pipSize: st.pipSize,
+      prices: [],
+      times: [],
+      digits,
+      fetchedAt: Date.now(),
+    });
+  }
+
+  if (seriesList.length === 0) {
+    if (forceNotify) {
+      emit({
+        type: 'AUTO_MONITOR_STATUS',
+        seededCount,
+        totalCount: markets.length,
+        top3: [],
+        topMarkets: [],
+        evaluatedAt: Date.now(),
+      });
+    }
+    return;
+  }
+
+  const ranked = runBacktestSuite(seriesList, {
+    strategy: 'DIGIT_OVER',
+    evenOddMode: 'reversal',
+    targetStreak: currentSettings?.targetStreak || 3,
+    baseStake: currentSettings?.globalStake || 1,
+    useRecovery: true,
+    tickCount: DCIRCLES_WINDOW_SIZE,
+  });
+
+  const top3 = ranked.slice(0, 3).map((r) => r.symbol);
+  const topMarkets = toCompactTopMarkets(ranked);
+
+  const prevSelected = Array.isArray(currentSettings?.selectedMarkets)
+    ? currentSettings.selectedMarkets
+    : [];
+  const prevSet = new Set(prevSelected);
+  const hasChanged =
+    top3.length > 0 &&
+    (top3.length !== prevSet.size || top3.some((sym) => !prevSet.has(sym)));
+
+  if (hasChanged) {
+    if (!isTradeActive) {
+      applyAutoTop3Selection(top3, topMarkets);
+      return;
+    } else {
+      pendingAutoTop3 = { top3, topMarkets };
+    }
+  }
+
+  emit({
+    type: 'AUTO_MONITOR_STATUS',
+    seededCount,
+    totalCount: markets.length,
+    top3,
+    topMarkets,
+    evaluatedAt: Date.now(),
+  });
+}
+
+function syncAutoRotateLoop() {
+  if (isAutoRotateOver1Enabled()) {
+    if (!autoRotateInterval) {
+      autoRotateInterval = setInterval(() => {
+        evaluateAutoTop3Over1(false);
+      }, 15000);
+    }
+  } else {
+    if (autoRotateInterval) {
+      clearInterval(autoRotateInterval);
+      autoRotateInterval = null;
+    }
+    pendingAutoTop3 = null;
+    lastSeededReadyEval = false;
+  }
+}
+
 function seed5kHistoryIfNeeded() {
   if (!publicWs || publicWs.readyState !== WebSocket.OPEN) return;
-  if (currentSettings?.strategy !== 'DCIRCLES_EVEN_ODD') return;
+  const needDCirclesSeed = currentSettings?.strategy === 'DCIRCLES_EVEN_ODD';
+  const needAutoOver1Seed = isAutoRotateOver1Enabled();
+  if (!needDCirclesSeed && !needAutoOver1Seed) return;
 
-  const targets = getSubscribedMarkets();
+  const targets = needAutoOver1Seed ? [...markets] : getSubscribedMarkets();
+  let inflightCount = Object.keys(historyReqIdToSymbol).length;
+
   for (const symbol of targets) {
+    if (inflightCount >= MAX_SEED_CONCURRENCY) break;
     const st = marketStates[symbol];
     if (!st || st.seeded5k || st.seeding5k) continue;
     st.seeding5k = true;
     const reqId = reqIdCounter++;
     historyReqIdToSymbol[reqId] = symbol;
+    inflightCount += 1;
     publicWs.send(
       JSON.stringify({
         ticks_history: symbol,
@@ -280,6 +454,7 @@ function connectPublicStream() {
         if (marketStates[failedSym]) {
           marketStates[failedSym].seeding5k = false;
         }
+        seed5kHistoryIfNeeded();
       }
       emit({ type: 'ERROR', message: data.error.message });
       return;
@@ -289,7 +464,10 @@ function connectPublicStream() {
       const reqId = data?.req_id || data?.echo_req?.req_id;
       const symbol = reqId ? historyReqIdToSymbol[reqId] : undefined;
       if (reqId) delete historyReqIdToSymbol[reqId];
-      if (!symbol || !marketStates[symbol]) return;
+      if (!symbol || !marketStates[symbol]) {
+        seed5kHistoryIfNeeded();
+        return;
+      }
 
       const state = marketStates[symbol];
       const rawPrices: Array<number | string> = data.history.prices || [];
@@ -314,7 +492,26 @@ function connectPublicStream() {
       state.lastSeedEpoch = typeof lastTime === 'number' ? lastTime : null;
       state.seeded5k = state.ring5kLen > 0;
       state.seeding5k = false;
-      queueUpdate(symbol, state);
+
+      if (getSubscribedMarkets().includes(symbol)) {
+        queueUpdate(symbol, state);
+      }
+
+      seed5kHistoryIfNeeded();
+
+      if (isAutoRotateOver1Enabled()) {
+        const seededCount = markets.filter((m) => marketStates[m].seeded5k).length;
+        if (seededCount === markets.length && !lastSeededReadyEval) {
+          lastSeededReadyEval = true;
+          evaluateAutoTop3Over1(true);
+        } else {
+          emit({
+            type: 'AUTO_MONITOR_STATUS',
+            seededCount,
+            totalCount: markets.length,
+          });
+        }
+      }
       return;
     }
 
@@ -350,7 +547,7 @@ function subscribeToMarketData() {
   if (isSubscribedToMarkets) return;
   isSubscribedToMarkets = true;
 
-  const targets = getSubscribedMarkets();
+  const targets = getStreamTargetMarkets();
   targets.forEach(symbol => {
     subscribeSymbol(symbol);
   });
@@ -359,7 +556,7 @@ function subscribeToMarketData() {
 function syncMarketSubscriptions() {
   if (!publicWs || publicWs.readyState !== WebSocket.OPEN) return;
 
-  const targetList = getSubscribedMarkets();
+  const targetList = getStreamTargetMarkets();
   const targetSet = new Set(targetList);
 
   const toRemove = Array.from(activeTickSymbols).filter(sym => !targetSet.has(sym));
@@ -374,6 +571,7 @@ function syncMarketSubscriptions() {
     toRemove.forEach(resetMarketState);
     isSubscribedToMarkets = false;
     subscribeToMarketData();
+    seed5kHistoryIfNeeded();
     return;
   }
 
@@ -581,7 +779,7 @@ function isMarketAllowed(symbol: string): boolean {
 
 function handleTick(tickInfo: any) {
   const symbol = tickInfo.symbol;
-  if (!symbol || !getSubscribedMarkets().includes(symbol)) return;
+  if (!symbol || !getStreamTargetMarkets().includes(symbol)) return;
   const state = marketStates[symbol];
   if (!state) return;
 
@@ -593,7 +791,10 @@ function handleTick(tickInfo: any) {
   state.pipSize = pipSize;
   state.digit = digit;
 
-  emit({ type: 'DIGIT_STAT', digit });
+  const isVisibleMarket = getSubscribedMarkets().includes(symbol);
+  if (isVisibleMarket) {
+    emit({ type: 'DIGIT_STAT', digit });
+  }
 
   // Evaluate D-Circles signal BEFORE absorbing this tick into the rolling 5K window
   const dCirclesSignalBeforeTick = state.seeded5k
@@ -629,7 +830,9 @@ function handleTick(tickInfo: any) {
   state.history[state.historyIndex] = digit;
   state.historyIndex = (state.historyIndex + 1) % HISTORY_SIZE;
 
-  queueUpdate(symbol, state);
+  if (isVisibleMarket) {
+    queueUpdate(symbol, state);
+  }
 
   if (isRunning && currentSettings) {
     const allowed = isMarketAllowed(symbol);
@@ -884,6 +1087,10 @@ function executeBuy(symbol: string) {
     isTradeActive = false;
     sessionPnL += pnl;
 
+    if (pendingAutoTop3 && isAutoRotateOver1Enabled()) {
+      applyAutoTop3Selection(pendingAutoTop3.top3, pendingAutoTop3.topMarkets);
+    }
+
     emit({
       type: 'STATE_SYNC',
       isRunning,
@@ -1003,6 +1210,10 @@ function handleContractUpdate(contract: any) {
     batchPnL = 0;
     batchSymbol = null;
 
+    if (pendingAutoTop3 && isAutoRotateOver1Enabled()) {
+      applyAutoTop3Selection(pendingAutoTop3.top3, pendingAutoTop3.topMarkets);
+    }
+
     emit({
       type: 'STATE_SYNC',
       isRunning,
@@ -1039,10 +1250,14 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     currentSettings = data.settings;
     globalCurrentStake = currentSettings?.globalStake || 1;
     emit({ type: 'STATE_SYNC', isRunning, currentStake: globalCurrentStake });
+    syncAutoRotateLoop();
     connectPublicStream();
     if (publicWs && publicWs.readyState === WebSocket.OPEN) {
       syncMarketSubscriptions();
       seed5kHistoryIfNeeded();
+      if (isAutoRotateOver1Enabled()) {
+        evaluateAutoTop3Over1(true);
+      }
     }
     if (currentSettings?.apiToken) {
       connectTradeStream();
@@ -1058,17 +1273,29 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     const newAccountId = data.settings?.activeAccountId;
     const prevAuthMethod = currentSettings?.authMethod;
     const newAuthMethod = data.settings?.authMethod;
+    const prevAutoRotate = isAutoRotateOver1Enabled();
+    const prevStreak = currentSettings?.targetStreak;
+    const prevStake = currentSettings?.globalStake;
 
     currentSettings = data.settings;
     if (cumulativeLoss === 0 && !isTradeActive) {
       globalCurrentStake = currentSettings?.globalStake || 1;
       emit({ type: 'STATE_SYNC', currentStake: globalCurrentStake });
     }
+    syncAutoRotateLoop();
     connectPublicStream();
 
     if (publicWs && publicWs.readyState === WebSocket.OPEN) {
       syncMarketSubscriptions();
       seed5kHistoryIfNeeded();
+      if (
+        isAutoRotateOver1Enabled() &&
+        (!prevAutoRotate ||
+          prevStreak !== currentSettings?.targetStreak ||
+          prevStake !== currentSettings?.globalStake)
+      ) {
+        evaluateAutoTop3Over1(true);
+      }
     }
 
     if (
@@ -1106,8 +1333,15 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
 
     isRunning = true;
     emit({ type: 'STATE_SYNC', isRunning: true, currentStake: globalCurrentStake, lastLostSymbol: null, isWaitingForRecovery: false });
+    syncAutoRotateLoop();
     connectPublicStream();
+    if (publicWs && publicWs.readyState === WebSocket.OPEN) {
+      syncMarketSubscriptions();
+    }
     seed5kHistoryIfNeeded();
+    if (isAutoRotateOver1Enabled()) {
+      evaluateAutoTop3Over1(true);
+    }
     connectTradeStream();
   }
 

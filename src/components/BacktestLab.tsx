@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Play,
+  Radio,
   RefreshCw,
   ShieldCheck,
   Sparkles,
@@ -128,6 +129,7 @@ function MarketChart({ result }: { result: MarketBacktestResult }) {
 
 export function BacktestLab() {
   const settings = useStore((state) => state.settings);
+  const autoRotateInfo = useStore((state) => state.autoRotateInfo);
   const setSettings = useStore((state) => state.setSettings);
   const toggleMarketSelection = useStore((state) => state.toggleMarketSelection);
   const setSelectedMarkets = useStore((state) => state.setSelectedMarkets);
@@ -263,6 +265,49 @@ export function BacktestLab() {
     }
   };
 
+  const isAutoRotateActive =
+    settings.strategy === 'DIGIT_OVER' && Boolean(settings.autoRotateTop3Over1);
+
+  const handleToggleAutoRotateTop3 = () => {
+    const nextEnabled = !isAutoRotateActive;
+    const top3 =
+      config.strategy === 'DIGIT_OVER' ? rankedResults.slice(0, 3).map((r) => r.symbol) : [];
+
+    const currentSubscribed = Array.isArray(settings.subscribedMarkets)
+      ? settings.subscribedMarkets
+      : [...ALL_MARKET_SYMBOLS];
+    const mergedSubscribed =
+      top3.length > 0
+        ? ALL_MARKET_SYMBOLS.filter((s) => currentSubscribed.includes(s) || top3.includes(s))
+        : currentSubscribed;
+
+    const updatedSettings = {
+      ...settings,
+      strategy: 'DIGIT_OVER' as StrategyType,
+      targetStreak: config.targetStreak,
+      globalStake: config.baseStake,
+      autoRotateTop3Over1: nextEnabled,
+      ...(nextEnabled && top3.length > 0
+        ? {
+            selectedMarkets: top3,
+            subscribedMarkets: mergedSubscribed,
+          }
+        : {}),
+    };
+
+    setConfig((prev) => ({ ...prev, strategy: 'DIGIT_OVER' }));
+    setSettings(updatedSettings);
+    window.dispatchEvent(new CustomEvent('bot_settings_changed', { detail: updatedSettings }));
+    setAppliedBanner(
+      nextEnabled
+        ? top3.length > 0
+          ? `Over 1 Auto-Monitor ON · Active Top 3: ${top3.join(', ')}`
+          : 'Over 1 Auto-Monitor ON · Seeding 5,000 ticks across all 17 markets...'
+        : 'Over 1 Auto-Monitor paused. Manual market selection active.'
+    );
+    setTimeout(() => setAppliedBanner(null), 5000);
+  };
+
   const handleApplyMarketsToBot = (symbolsToApply: string[], label: string) => {
     const valid = symbolsToApply.filter((s) => ALL_MARKET_SYMBOLS.includes(s as any));
     if (valid.length === 0) return;
@@ -280,6 +325,7 @@ export function BacktestLab() {
       evenOddMode: config.evenOddMode,
       targetStreak: config.targetStreak,
       globalStake: config.baseStake,
+      autoRotateTop3Over1: false,
       selectedMarkets: valid,
       subscribedMarkets: mergedSubscribed,
     };
@@ -315,32 +361,50 @@ export function BacktestLab() {
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => handleRunBacktest()}
-              disabled={isFetching}
-              className="px-4 py-2 rounded bg-[#00ff9c] text-[#09090b] hover:opacity-90 disabled:opacity-50 font-mono text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              {isFetching ? (
-                <>
-                  <RefreshCw size={13} className="animate-spin" />
-                  <span>
-                    Scanning {fetchProgress?.completed ?? 0}/{fetchProgress?.total ?? 17}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <Play size={13} fill="currentColor" />
-                  <span>
-                    {tickCache.length > 0
-                      ? config.strategy === 'DCIRCLES_EVEN_ODD'
-                        ? 'Re-scan 10K (5K+5K)'
-                        : 'Re-scan 5K Ticks'
-                      : 'Find Best Markets'}
-                  </span>
-                </>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {config.strategy === 'DIGIT_OVER' && (
+                <button
+                  type="button"
+                  onClick={handleToggleAutoRotateTop3}
+                  className={`px-3.5 py-2 rounded border font-mono text-xs font-bold flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-colors ${
+                    isAutoRotateActive
+                      ? 'bg-[#00ff9c]/15 border-[#00ff9c] text-[#00ff9c]'
+                      : 'bg-[#18181b] border-[#27272a] text-[#e4e4e7] hover:border-[#00ff9c]/60 hover:text-[#00ff9c]'
+                  }`}
+                  title="Continuously monitor 5,000 ticks across all 17 markets and auto-rotate to the best Top 3 between trades"
+                >
+                  <Radio size={13} className={isAutoRotateActive ? 'animate-pulse' : ''} />
+                  <span>{isAutoRotateActive ? 'Auto-Monitor Top 3: ON' : 'Auto-Monitor Top 3'}</span>
+                </button>
               )}
-            </button>
+
+              <button
+                type="button"
+                onClick={() => handleRunBacktest()}
+                disabled={isFetching}
+                className="px-4 py-2 rounded bg-[#00ff9c] text-[#09090b] hover:opacity-90 disabled:opacity-50 font-mono text-xs font-bold flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                {isFetching ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin" />
+                    <span>
+                      Scanning {fetchProgress?.completed ?? 0}/{fetchProgress?.total ?? 17}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Play size={13} fill="currentColor" />
+                    <span>
+                      {tickCache.length > 0
+                        ? config.strategy === 'DCIRCLES_EVEN_ODD'
+                          ? 'Re-scan 10K (5K+5K)'
+                          : 'Re-scan 5K Ticks'
+                        : 'Find Best Markets'}
+                    </span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-end gap-3 pt-3 border-t border-[#27272a] font-mono text-xs">
@@ -482,6 +546,91 @@ export function BacktestLab() {
             </div>
           )}
         </div>
+
+        {/* Continuous 5K Over-1 Auto-Monitor Live Status */}
+        {isAutoRotateActive && (
+          <div className="bg-[#111114] border border-[#00ff9c]/40 rounded-lg p-4 space-y-3 font-mono text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-[#00ff9c] animate-pulse" />
+                <span className="font-bold text-[#00ff9c] uppercase tracking-wider">
+                  Over 1 Continuous 5K Monitor Active
+                </span>
+                <span className="text-[#a1a1aa] tabular-nums">
+                  {autoRotateInfo.seededCount}/{autoRotateInfo.totalCount} markets seeded
+                </span>
+              </div>
+              <div className="flex items-center gap-3 text-[11px] text-[#a1a1aa] tabular-nums">
+                {autoRotateInfo.lastEvaluatedAt && (
+                  <span>
+                    Last check: {new Date(autoRotateInfo.lastEvaluatedAt).toLocaleTimeString()}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={handleToggleAutoRotateTop3}
+                  className="text-[#ff4b4b] hover:underline font-bold cursor-pointer"
+                >
+                  Pause Auto
+                </button>
+              </div>
+            </div>
+
+            {autoRotateInfo.seededCount < autoRotateInfo.totalCount && (
+              <div className="h-1.5 w-full bg-[#18181b] rounded overflow-hidden">
+                <div
+                  className="h-full bg-[#00ff9c] transition-all duration-200"
+                  style={{
+                    width: `${Math.round(
+                      (autoRotateInfo.seededCount / Math.max(1, autoRotateInfo.totalCount)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#a1a1aa]">
+              <span>
+                Active Top 3:{' '}
+                <strong className="text-[#e4e4e7]">
+                  {(autoRotateInfo.top3.length > 0 ? autoRotateInfo.top3 : selectedLiveMarkets).join(', ') || 'Evaluating...'}
+                </strong>
+              </span>
+              <span>Re-ranks all 17 rolling 5K windows every 15s · Switches only between active trades</span>
+            </div>
+
+            {autoRotateInfo.topMarkets.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-5 gap-2 pt-1">
+                {autoRotateInfo.topMarkets.map((m, idx) => {
+                  const isTop3 = idx < 3;
+                  return (
+                    <div
+                      key={m.symbol}
+                      className={`rounded border px-2.5 py-2 tabular-nums ${
+                        isTop3
+                          ? 'bg-[#00ff9c]/5 border-[#00ff9c]/40'
+                          : 'bg-[#09090b] border-[#27272a]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className={`font-bold ${isTop3 ? 'text-[#00ff9c]' : 'text-[#a1a1aa]'}`}>
+                          #{idx + 1} {m.symbol}
+                        </span>
+                        <span className="text-[10px] text-[#71717a]">{m.riskTier}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] mt-1">
+                        <span className="text-[#ff4b4b]">-${m.maxDrawdown.toFixed(2)}</span>
+                        <span className={m.netPnL >= 0 ? 'text-[#00ff9c]' : 'text-[#ff4b4b]'}>
+                          {m.netPnL >= 0 ? '+' : ''}${m.netPnL.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Empty State */}
         {tickCache.length === 0 && !isFetching && (
@@ -678,6 +827,9 @@ export function BacktestLab() {
                             className="py-2.5 px-3 text-right"
                             onClick={(e) => {
                               e.stopPropagation();
+                              if (isAutoRotateActive) {
+                                setSettings({ autoRotateTop3Over1: false });
+                              }
                               toggleMarketSelection(row.symbol);
                             }}
                           >
