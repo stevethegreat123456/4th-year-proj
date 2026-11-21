@@ -74,6 +74,15 @@ let autoRotateInterval: any = null;
 let lastSeededReadyEval = false;
 const MAX_SEED_CONCURRENCY = 4;
 
+const CONSERVATIVE_OVER1_FALLBACK = 0.175;
+const CONSERVATIVE_EVENODD_FALLBACK = 0.945;
+const YIELD_SAFETY_CUSHION = 0.005;
+const marketOver1Yields: Record<string, { yield: number; updatedAt: number }> = {};
+const marketEvenOddYields: Record<string, { yield: number; updatedAt: number }> = {};
+const proposalReqIdToMeta: Record<number, { symbol: string; kind: 'DIGIT_OVER' | 'EVEN_ODD' }> = {};
+let payoutRefreshInterval: any = null;
+let lastPayoutProbeAt = 0;
+
 let tradeWs: WebSocket | null = null;
 let tradePingInterval: any = null;
 let fallbackToDefaultAppId = false;
@@ -103,6 +112,122 @@ let batchTimeout: any = null;
 let pendingContracts: Record<number, { customId: string, symbol: string, stake: number, timestamp: number }> = {};
 let reqIdToSymbol: Record<number, string> = {};
 let reqIdCounter = Math.floor(Date.now() / 1000);
+
+function getActiveStrategyKind(): 'DIGIT_OVER' | 'EVEN_ODD' {
+  return currentSettings?.strategy === 'EVEN_ODD' || currentSettings?.strategy === 'DCIRCLES_EVEN_ODD'
+    ? 'EVEN_ODD'
+    : 'DIGIT_OVER';
+}
+
+function getKnownYieldForSymbol(symbol: string, kind: 'DIGIT_OVER' | 'EVEN_ODD'): number {
+  if (kind === 'EVEN_ODD') {
+    return marketEvenOddYields[symbol]?.yield ?? CONSERVATIVE_EVENODD_FALLBACK;
+  }
+  return marketOver1Yields[symbol]?.yield ?? CONSERVATIVE_OVER1_FALLBACK;
+}
+
+function recordObservedYield(symbol: string, contractType: string | undefined, buyPrice: number, payout: number) {
+  if (!symbol || !(buyPrice > 0) || !(payout > buyPrice)) return;
+  const observedYield = (payout - buyPrice) / buyPrice;
+  if (!Number.isFinite(observedYield) || observedYield <= 0.01) return;
+  if (contractType === 'DIGITOVER') {
+    marketOver1Yields[symbol] = { yield: observedYield, updatedAt: Date.now() };
+  } else if (contractType === 'DIGITEVEN' || contractType === 'DIGITODD') {
+    marketEvenOddYields[symbol] = { yield: observedYield, updatedAt: Date.now() };
+  }
+}
+
+function computeRecoveryStakeForSymbol(
+  symbol: string,
+  kind: 'DIGIT_OVER' | 'EVEN_ODD',
+  lossToRecover: number
+): number {
+  const baseStake = Math.max(0.35, Number(currentSettings?.globalStake) || 1);
+  if (lossToRecover <= 0) return baseStake;
+
+  const rawYield = getKnownYieldForSymbol(symbol, kind);
+  const safeYield = Math.max(0.05, rawYield - YIELD_SAFETY_CUSHION);
+  const targetProfit = Math.max(0.01, baseStake * rawYield);
+  let stake = Math.ceil(((lossToRecover + targetProfit) / safeYield) * 100) / 100;
+
+  while (Math.floor(stake * safeYield * 100) / 100 <= lossToRecover) {
+    stake = Math.ceil((stake + 0.01) * 100) / 100;
+  }
+  return stake;
+}
+
+function getPreviewRecoveryStake(
+  kind: 'DIGIT_OVER' | 'EVEN_ODD',
+  lossToRecover: number,
+  fallbackSymbol?: string
+): number {
+  const baseStake = Math.max(0.35, Number(currentSettings?.globalStake) || 1);
+  if (lossToRecover <= 0) return baseStake;
+
+  const activeSymbols =
+    Array.isArray(currentSettings?.selectedMarkets) && currentSettings.selectedMarkets.length > 0
+      ? currentSettings.selectedMarkets.filter((s: string) => markets.includes(s))
+      : fallbackSymbol
+        ? [fallbackSymbol]
+        : markets;
+
+  let worstYield = Infinity;
+  let worstSymbol = fallbackSymbol || markets[0];
+  for (const sym of activeSymbols) {
+    const y = getKnownYieldForSymbol(sym, kind);
+    if (y < worstYield) {
+      worstYield = y;
+      worstSymbol = sym;
+    }
+  }
+  return computeRecoveryStakeForSymbol(worstSymbol, kind, lossToRecover);
+}
+
+function refreshMarketPayouts(force = false) {
+  const now = Date.now();
+  if (!force && now - lastPayoutProbeAt < 30000) return;
+
+  const useTradeSocket = Boolean(tradeWs && tradeWs.readyState === WebSocket.OPEN);
+  const ws = useTradeSocket ? tradeWs : publicWs;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  lastPayoutProbeAt = now;
+  const currency = currentSettings?.accountCurrency || 'USD';
+  const probeAmount = Math.max(1, Number(currentSettings?.globalStake) || 1);
+  const strategyKind = getActiveStrategyKind();
+  const targets = getStreamTargetMarkets();
+  const symbolField = !useTradeSocket || isOtpSocket ? 'underlying_symbol' : 'symbol';
+
+  for (const sym of targets) {
+    const reqId = reqIdCounter++;
+    proposalReqIdToMeta[reqId] = { symbol: sym, kind: strategyKind };
+    const payload: Record<string, any> = {
+      proposal: 1,
+      amount: probeAmount,
+      basis: 'stake',
+      contract_type: strategyKind === 'EVEN_ODD' ? 'DIGITEVEN' : 'DIGITOVER',
+      currency,
+      duration: 1,
+      duration_unit: 't',
+      [symbolField]: sym,
+      req_id: reqId,
+    };
+    if (strategyKind === 'DIGIT_OVER') {
+      payload.barrier = '1';
+    }
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch {
+      delete proposalReqIdToMeta[reqId];
+    }
+  }
+}
+
+if (!payoutRefreshInterval) {
+  payoutRefreshInterval = setInterval(() => {
+    refreshMarketPayouts(false);
+  }, 60000);
+}
 
 function emit(event: any) {
   self.postMessage(event);
@@ -302,6 +427,7 @@ function evaluateAutoTop3Over1(forceNotify = false) {
       prices: [],
       times: [],
       digits,
+      over1Yield: marketOver1Yields[sym]?.yield,
       fetchedAt: Date.now(),
     });
   }
@@ -436,6 +562,7 @@ function connectPublicStream() {
     emit({ type: 'STATUS', status: 'connected' });
     subscribeToMarketData();
     seed5kHistoryIfNeeded();
+    refreshMarketPayouts(true);
   };
 
   publicWs.onmessage = (msg) => {
@@ -443,6 +570,23 @@ function connectPublicStream() {
     try {
       data = JSON.parse(msg.data);
     } catch (e) {
+      return;
+    }
+
+    const propReqId = data?.req_id || data?.echo_req?.req_id;
+    if (propReqId && proposalReqIdToMeta[propReqId]) {
+      const meta = proposalReqIdToMeta[propReqId];
+      delete proposalReqIdToMeta[propReqId];
+      if (!data.error && data.proposal) {
+        const ask = Number(data.proposal.ask_price);
+        const payout = Number(data.proposal.payout);
+        recordObservedYield(
+          meta.symbol,
+          meta.kind === 'EVEN_ODD' ? 'DIGITEVEN' : 'DIGITOVER',
+          ask,
+          payout
+        );
+      }
       return;
     }
 
@@ -588,6 +732,9 @@ function syncMarketSubscriptions() {
     subscribeSymbol(sym);
   }
   seed5kHistoryIfNeeded();
+  if (toAdd.length > 0) {
+    refreshMarketPayouts(true);
+  }
 }
 
 /**
@@ -684,6 +831,7 @@ async function connectTradeStream() {
       // OTP WebSocket is already authenticated for the selected account
       tradeWs?.send('{"balance":1,"subscribe":1}');
       tradeWs?.send('{"proposal_open_contract":1,"subscribe":1}');
+      refreshMarketPayouts(true);
     } else if (currentSettings?.apiToken) {
       tradeWs?.send(JSON.stringify({ authorize: currentSettings.apiToken }));
     }
@@ -701,6 +849,23 @@ async function connectTradeStream() {
     try {
       data = JSON.parse(msg.data);
     } catch (e) {
+      return;
+    }
+
+    const propReqId = data?.req_id || data?.echo_req?.req_id;
+    if (propReqId && proposalReqIdToMeta[propReqId]) {
+      const meta = proposalReqIdToMeta[propReqId];
+      delete proposalReqIdToMeta[propReqId];
+      if (!data.error && data.proposal) {
+        const ask = Number(data.proposal.ask_price);
+        const payout = Number(data.proposal.payout);
+        recordObservedYield(
+          meta.symbol,
+          meta.kind === 'EVEN_ODD' ? 'DIGITEVEN' : 'DIGITOVER',
+          ask,
+          payout
+        );
+      }
       return;
     }
 
@@ -743,6 +908,7 @@ async function connectTradeStream() {
       });
       tradeWs?.send('{"balance":1,"subscribe":1}');
       tradeWs?.send('{"proposal_open_contract":1,"subscribe":1}');
+      refreshMarketPayouts(true);
     } else if (data.msg_type === 'balance') {
       const balVal = Number(data.balance?.balance ?? data.balance);
       if (!Number.isNaN(balVal)) {
@@ -910,7 +1076,8 @@ function executeEvenOdd(symbol: string, contractType: 'DIGITEVEN' | 'DIGITODD') 
   if (!currentSettings || !currentSettings.apiToken) return;
 
   const reqId = reqIdCounter++;
-  const stake = globalCurrentStake;
+  const stake = computeRecoveryStakeForSymbol(symbol, 'EVEN_ODD', cumulativeLoss);
+  globalCurrentStake = stake;
 
   expectedCallbacks = 1;
   batchPnL = 0;
@@ -952,6 +1119,7 @@ function executeEvenOdd(symbol: string, contractType: 'DIGITEVEN' | 'DIGITODD') 
       contractType
     }
   });
+  emit({ type: 'STATE_SYNC', currentStake: stake });
 
   if (deadlockTimeoutId) {
     clearTimeout(deadlockTimeoutId);
@@ -977,12 +1145,8 @@ function executeEvenOdd(symbol: string, contractType: 'DIGITEVEN' | 'DIGITODD') 
       contractType
     });
 
-    cumulativeLoss += Math.abs(pnl);
-
-    const safeYield = 0.95;
-    const targetProfit = currentSettings.globalStake * safeYield;
-    const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-    globalCurrentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
+    cumulativeLoss = Number((cumulativeLoss + Math.abs(pnl)).toFixed(2));
+    globalCurrentStake = getPreviewRecoveryStake('EVEN_ODD', cumulativeLoss, symbol);
 
     lastLostSymbol = symbol;
     isTradeActive = false;
@@ -1009,7 +1173,8 @@ function executeBuy(symbol: string) {
   if (!currentSettings || !currentSettings.apiToken) return;
 
   const reqId = reqIdCounter++;
-  const stake = globalCurrentStake;
+  const stake = computeRecoveryStakeForSymbol(symbol, 'DIGIT_OVER', cumulativeLoss);
+  globalCurrentStake = stake;
 
   expectedCallbacks = 1;
   batchPnL = 0;
@@ -1052,6 +1217,7 @@ function executeBuy(symbol: string) {
       pnl: 0
     }
   });
+  emit({ type: 'STATE_SYNC', currentStake: stake });
 
   if (deadlockTimeoutId) {
     clearTimeout(deadlockTimeoutId);
@@ -1076,12 +1242,8 @@ function executeBuy(symbol: string) {
       exitTick: 'TIMEOUT'
     });
 
-    cumulativeLoss += Math.abs(pnl);
-
-    const safeYield = (currentSettings?.strategy === 'EVEN_ODD' || currentSettings?.strategy === 'DCIRCLES_EVEN_ODD') ? 0.95 : 0.21;
-    const targetProfit = currentSettings.globalStake * safeYield;
-    const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-    globalCurrentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
+    cumulativeLoss = Number((cumulativeLoss + Math.abs(pnl)).toFixed(2));
+    globalCurrentStake = getPreviewRecoveryStake('DIGIT_OVER', cumulativeLoss, symbol);
 
     lastLostSymbol = symbol;
     isTradeActive = false;
@@ -1113,10 +1275,15 @@ function handleBuy(buyInfo: any, echo_req: any) {
   if (reqId) {
     const symbol = reqIdToSymbol[reqId];
     if (symbol) {
+      const buyPrice = Number(buyInfo.buy_price) || globalCurrentStake;
+      const contractPayout = Number(buyInfo.payout);
+      const contractType = echo_req?.parameters?.contract_type;
+      recordObservedYield(symbol, contractType, buyPrice, contractPayout);
+
       pendingContracts[contractId] = {
         customId: reqId.toString(),
         symbol,
-        stake: Number(buyInfo.buy_price) || globalCurrentStake,
+        stake: buyPrice,
         timestamp: Number(buyInfo.start_time) * 1000 || Date.now()
       };
       delete reqIdToSymbol[reqId];
@@ -1144,7 +1311,11 @@ function handleContractUpdate(contract: any) {
     return;
   }
 
-  const { customId, symbol } = pending;
+  const { customId, symbol, stake: recordedStake } = pending;
+  const buyPrice = Number(contract.buy_price) || recordedStake || globalCurrentStake;
+  const contractPayout = Number(contract.payout);
+  recordObservedYield(symbol, contract.contract_type, buyPrice, contractPayout);
+
   const pnl = Number(contract.profit) || 0;
   const isWin = pnl > 0;
 
@@ -1157,7 +1328,7 @@ function handleContractUpdate(contract: any) {
     type: 'TRADE_RESULT',
     id: customId,
     market: symbol,
-    buyPrice: contract.buy_price || globalCurrentStake,
+    buyPrice,
     timestamp: contract.date_start ? contract.date_start * 1000 : Date.now(),
     result: isWin ? 'won' : 'lost',
     pnl: pnl,
@@ -1179,29 +1350,37 @@ function handleContractUpdate(contract: any) {
       deadlockTimeoutId = null;
     }
 
+    const strategyKind = getActiveStrategyKind();
     const batchWin = batchPnL > 0;
 
     if (batchWin) {
-      globalCurrentStake = currentSettings.globalStake;
-      cumulativeLoss = 0;
-      lastLostSymbol = null;
+      const remainingLoss =
+        cumulativeLoss > 0 ? Number((cumulativeLoss - batchPnL).toFixed(2)) : 0;
 
-      if (stopScheduledAndWaitingForRecovery) {
-        isRunning = false;
-        stopScheduledAndWaitingForRecovery = false;
-        markets.forEach(m => {
-          marketStates[m].streak = 0;
-          marketStates[m].evenStreak = 0;
-          marketStates[m].oddStreak = 0;
-        });
-        emit({ type: 'SCHEDULE_STOP' });
+      if (remainingLoss <= 0) {
+        globalCurrentStake = currentSettings.globalStake;
+        cumulativeLoss = 0;
+        lastLostSymbol = null;
+
+        if (stopScheduledAndWaitingForRecovery) {
+          isRunning = false;
+          stopScheduledAndWaitingForRecovery = false;
+          markets.forEach(m => {
+            marketStates[m].streak = 0;
+            marketStates[m].evenStreak = 0;
+            marketStates[m].oddStreak = 0;
+          });
+          emit({ type: 'SCHEDULE_STOP' });
+        }
+      } else {
+        // Trade won, but lower payout left a remaining deficit — keep recovering until net >= 0
+        cumulativeLoss = remainingLoss;
+        globalCurrentStake = getPreviewRecoveryStake(strategyKind, cumulativeLoss, symbol);
+        lastLostSymbol = symbol;
       }
     } else {
-      cumulativeLoss += Math.abs(batchPnL);
-      const safeYield = (currentSettings?.strategy === 'EVEN_ODD' || currentSettings?.strategy === 'DCIRCLES_EVEN_ODD') ? 0.95 : 0.21;
-      const targetProfit = currentSettings.globalStake * safeYield;
-      const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-      globalCurrentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
+      cumulativeLoss = Number((cumulativeLoss + Math.abs(batchPnL)).toFixed(2));
+      globalCurrentStake = getPreviewRecoveryStake(strategyKind, cumulativeLoss, symbol);
       lastLostSymbol = symbol;
     }
 
@@ -1276,14 +1455,28 @@ self.onmessage = (e: MessageEvent<WorkerCommand>) => {
     const prevAutoRotate = isAutoRotateOver1Enabled();
     const prevStreak = currentSettings?.targetStreak;
     const prevStake = currentSettings?.globalStake;
+    const prevStrategy = currentSettings?.strategy;
+    const prevCurrency = currentSettings?.accountCurrency;
 
     currentSettings = data.settings;
-    if (cumulativeLoss === 0 && !isTradeActive) {
-      globalCurrentStake = currentSettings?.globalStake || 1;
+    if (!isTradeActive) {
+      if (cumulativeLoss === 0) {
+        globalCurrentStake = currentSettings?.globalStake || 1;
+      } else {
+        globalCurrentStake = getPreviewRecoveryStake(getActiveStrategyKind(), cumulativeLoss, lastLostSymbol || undefined);
+      }
       emit({ type: 'STATE_SYNC', currentStake: globalCurrentStake });
     }
     syncAutoRotateLoop();
     connectPublicStream();
+
+    if (
+      prevStrategy !== currentSettings?.strategy ||
+      prevStake !== currentSettings?.globalStake ||
+      prevCurrency !== currentSettings?.accountCurrency
+    ) {
+      refreshMarketPayouts(true);
+    }
 
     if (publicWs && publicWs.readyState === WebSocket.OPEN) {
       syncMarketSubscriptions();

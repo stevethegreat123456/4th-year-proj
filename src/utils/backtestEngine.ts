@@ -36,6 +36,7 @@ export interface MarketTickSeries {
   prices: number[];
   times: number[];
   digits: number[];
+  over1Yield?: number;
   fetchedAt: number;
 }
 
@@ -143,6 +144,8 @@ export async function fetchMarketsTickHistory(
     }
 
     const resultsMap: Record<string, MarketTickSeries> = {};
+    const yieldsMap: Record<string, number> = {};
+    const proposalReqs = new Map<number, string>();
     const errors: Record<string, string> = {};
     const requestedCount = Math.min(Math.max(count, 100), 10000);
     const queue = [...uniqueSymbols];
@@ -222,6 +225,7 @@ export async function fetchMarketsTickHistory(
         prices,
         times: combinedTimes,
         digits,
+        over1Yield: yieldsMap[symbol],
         fetchedAt: Date.now(),
       };
       markDone(symbol);
@@ -288,6 +292,24 @@ export async function fetchMarketsTickHistory(
     }, 90000);
 
     ws.onopen = () => {
+      for (const sym of uniqueSymbols) {
+        const propReqId = reqCounter++;
+        proposalReqs.set(propReqId, sym);
+        ws.send(
+          JSON.stringify({
+            proposal: 1,
+            amount: 10,
+            basis: 'stake',
+            contract_type: 'DIGITOVER',
+            currency: 'USD',
+            duration: 1,
+            duration_unit: 't',
+            barrier: '1',
+            underlying_symbol: sym,
+            req_id: propReqId,
+          })
+        );
+      }
       onProgress?.({
         completed: 0,
         total: uniqueSymbols.length,
@@ -306,6 +328,23 @@ export async function fetchMarketsTickHistory(
       }
 
       const reqId = data?.req_id || data?.echo_req?.req_id;
+      if (reqId && proposalReqs.has(reqId)) {
+        const sym = proposalReqs.get(reqId)!;
+        proposalReqs.delete(reqId);
+        if (data.proposal) {
+          const ask = Number(data.proposal.ask_price);
+          const payout = Number(data.proposal.payout);
+          if (ask > 0 && payout > ask) {
+            const observed = (payout - ask) / ask;
+            yieldsMap[sym] = observed;
+            if (resultsMap[sym]) {
+              resultsMap[sym].over1Yield = observed;
+            }
+          }
+        }
+        return;
+      }
+
       if (!reqId || !inflight.has(reqId)) return;
 
       const entry = inflight.get(reqId)!;
@@ -455,7 +494,18 @@ export function simulateMarketBacktest(
   const baseStake = Math.max(0.35, Number(config.baseStake) || 1);
   const isEvenOddFamily =
     config.strategy === 'EVEN_ODD' || config.strategy === 'DCIRCLES_EVEN_ODD';
-  const safeYield = isEvenOddFamily ? 0.95 : 0.21;
+  const rawYield = isEvenOddFamily ? 0.95 : (series.over1Yield ?? 0.21);
+  const safeYield = Math.max(0.05, rawYield - (isEvenOddFamily ? 0 : 0.005));
+
+  const calcNextRecoveryStake = (lossToRecover: number): number => {
+    if (!config.useRecovery || lossToRecover <= 0) return baseStake;
+    const targetProfit = Math.max(0.01, baseStake * rawYield);
+    let nextStake = Math.ceil(((lossToRecover + targetProfit) / safeYield) * 100) / 100;
+    while (Math.floor(nextStake * rawYield * 100) / 100 <= lossToRecover) {
+      nextStake = Math.ceil((nextStake + 0.01) * 100) / 100;
+    }
+    return nextStake;
+  };
 
   let over1Streak = 0;
   let evenStreak = 0;
@@ -552,14 +602,20 @@ export function simulateMarketBacktest(
         const stake = currentStake;
         if (stake > maxStakeUsed) maxStakeUsed = stake;
 
-        const pnl = won ? Number((stake * safeYield).toFixed(2)) : Number((-stake).toFixed(2));
+        const pnl = won ? Number((stake * rawYield).toFixed(2)) : Number((-stake).toFixed(2));
 
         if (won) {
           wins += 1;
           grossProfit += pnl;
           consecutiveLosses = 0;
-          cumulativeLoss = 0;
-          currentStake = baseStake;
+          if (cumulativeLoss > 0) {
+            const remainingLoss = Number((cumulativeLoss - pnl).toFixed(2));
+            cumulativeLoss = remainingLoss > 0 ? remainingLoss : 0;
+            currentStake = cumulativeLoss > 0 ? calcNextRecoveryStake(cumulativeLoss) : baseStake;
+          } else {
+            cumulativeLoss = 0;
+            currentStake = baseStake;
+          }
         } else {
           losses += 1;
           grossLoss += Math.abs(pnl);
@@ -567,14 +623,8 @@ export function simulateMarketBacktest(
           if (consecutiveLosses > maxConsecutiveLosses) {
             maxConsecutiveLosses = consecutiveLosses;
           }
-          cumulativeLoss += stake;
-          if (config.useRecovery) {
-            const targetProfit = baseStake * safeYield;
-            const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-            currentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
-          } else {
-            currentStake = baseStake;
-          }
+          cumulativeLoss = Number((cumulativeLoss + stake).toFixed(2));
+          currentStake = calcNextRecoveryStake(cumulativeLoss);
         }
 
         equity = Number((equity + pnl).toFixed(2));
@@ -658,14 +708,20 @@ export function simulateMarketBacktest(
         const stake = currentStake;
         if (stake > maxStakeUsed) maxStakeUsed = stake;
 
-        const pnl = won ? Number((stake * safeYield).toFixed(2)) : Number((-stake).toFixed(2));
+        const pnl = won ? Number((stake * rawYield).toFixed(2)) : Number((-stake).toFixed(2));
 
         if (won) {
           wins += 1;
           grossProfit += pnl;
           consecutiveLosses = 0;
-          cumulativeLoss = 0;
-          currentStake = baseStake;
+          if (cumulativeLoss > 0) {
+            const remainingLoss = Number((cumulativeLoss - pnl).toFixed(2));
+            cumulativeLoss = remainingLoss > 0 ? remainingLoss : 0;
+            currentStake = cumulativeLoss > 0 ? calcNextRecoveryStake(cumulativeLoss) : baseStake;
+          } else {
+            cumulativeLoss = 0;
+            currentStake = baseStake;
+          }
         } else {
           losses += 1;
           grossLoss += Math.abs(pnl);
@@ -673,14 +729,8 @@ export function simulateMarketBacktest(
           if (consecutiveLosses > maxConsecutiveLosses) {
             maxConsecutiveLosses = consecutiveLosses;
           }
-          cumulativeLoss += stake;
-          if (config.useRecovery) {
-            const targetProfit = baseStake * safeYield;
-            const preciseRecoveryStake = (cumulativeLoss + targetProfit) / safeYield;
-            currentStake = Math.ceil(preciseRecoveryStake * 100) / 100;
-          } else {
-            currentStake = baseStake;
-          }
+          cumulativeLoss = Number((cumulativeLoss + stake).toFixed(2));
+          currentStake = calcNextRecoveryStake(cumulativeLoss);
         }
 
         equity = Number((equity + pnl).toFixed(2));
